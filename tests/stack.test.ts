@@ -1142,7 +1142,7 @@ const makeSyncNovel = () => {
             Effect.succeed(
               from === "dev-1" && branch === "stack-b"
                 ? ["b1", "b2"]
-                : from === "old-base" && branch === "stack-c"
+                : from === "stack-b-1" && branch === "stack-c"
                   ? ["b1", "b2", "c1"]
                   : [],
             ),
@@ -2354,6 +2354,49 @@ describe("Stack", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("sync infers a child anchor from the unchanged remote parent tip", () => {
+    const commitRanges: Array<string> = [];
+    const refs = [
+      ref("dev", "dev-head"),
+      ref("parent", "parent-repaired"),
+      ref("child", "child-old"),
+    ];
+    const layer = stackTestLayer({
+      current: "child",
+      refs,
+      pulls: [pr(1, "parent", "dev"), pr(2, "child", "parent")],
+      bases: bases(
+        ["parent", "dev", "dev-head"],
+        ["child", "parent", "shared-merge-base"],
+        ["child", "origin/parent", "parent-before-repair"],
+      ),
+      service: {
+        head: (name) =>
+          Effect.succeed(
+            Option.fromNullishOr(
+              name === "origin/parent" ? "parent-before-repair" : refsHead(refs, name),
+            ),
+          ),
+        commits: (from, branch) =>
+          Effect.sync(() => {
+            commitRanges.push(`${from}:${branch}`);
+            return ["child-only"];
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const store = yield* Store;
+      yield* stack.sync({ apply: true });
+      const undo = yield* store.readUndo();
+
+      expect(commitRanges).toContain("parent-before-repair:child");
+      expect(commitRanges).not.toContain("shared-merge-base:child");
+      expect(undo?.actions).toContain("infer link: child -> parent @ parent-before-repair");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("sync previews stale metadata reconciliation", () => {
     const layer = stackTestLayer({
       current: "stack-b",
@@ -3124,6 +3167,96 @@ describe("Stack", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("sync uses persisted anchors for a repaired parent fork across repeated syncs", () => {
+    const seen: Array<string> = [];
+    const refs = new Map([
+      ["dev", ref("dev", "dev-head")],
+      ["parent", ref("parent", "parent-repaired")],
+      ["child-a", ref("child-a", "child-a-old")],
+      ["child-b", ref("child-b", "child-b-old")],
+    ]);
+    const baseMap = new Map([
+      ["parent:origin/dev", "dev-head"],
+      ["child-a:parent", "shared-merge-base"],
+      ["child-b:parent", "shared-merge-base"],
+    ]);
+    const pulls = [pr(1, "parent", "dev"), pr(2, "child-a", "parent"), pr(3, "child-b", "parent")];
+    const layer = stackTestLayer({
+      current: "child-a",
+      refs: [...refs.values()],
+      pulls,
+      state: stackState([
+        stackLink({ branch: "parent", parent: "dev", anchor: "dev-head", pr: 1 }),
+        stackLink({ branch: "child-a", parent: "parent", anchor: "parent-before-repair", pr: 2 }),
+        stackLink({ branch: "child-b", parent: "parent", anchor: "parent-before-repair", pr: 3 }),
+      ]),
+      service: {
+        refs: () => Effect.succeed([...refs.values()]),
+        head: (name) =>
+          Effect.succeed(
+            Option.fromNullishOr(
+              refs.get(name)?.head ??
+                (name.startsWith("origin/") ? refs.get(name.slice(7))?.head : undefined),
+            ),
+          ),
+        base: (branch, parent) =>
+          Effect.succeed(Option.fromNullishOr(baseMap.get(`${branch}:${parent}`))),
+        commits: (from, branch) =>
+          Effect.succeed(
+            from === "parent-before-repair"
+              ? [`${branch}-only`]
+              : from === "shared-merge-base"
+                ? ["parent-1", `${branch}-only`]
+                : [],
+          ),
+        novel: (_parent, _branch, commits) => Effect.succeed(commits),
+        replay: (branch, parent, commits) =>
+          Effect.sync(() => {
+            seen.push(`${branch}:${commits.join(",")}`);
+            refs.set(branch, ref(branch, `${branch}-repaired`));
+            baseMap.set(`${branch}:${parent}`, refs.get(parent)?.head ?? "");
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ apply: true });
+      yield* stack.sync({ apply: true });
+
+      expect(seen).toEqual(["child-a:child-a-only", "child-b:child-b-only"]);
+      expect(seen.join(",")).not.toContain("parent-1");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("sync leaves a clean root alone when only the trunk advanced", () => {
+    const seen: Array<string> = [];
+    const layer = stackTestLayer({
+      current: "child",
+      refs: [ref("dev", "dev-new"), ref("root", "root-head"), ref("child", "child-head")],
+      pulls: [pr(1, "root", "dev"), pr(2, "child", "root")],
+      bases: bases(["root", "origin/dev", "dev-old"], ["child", "root", "root-old"]),
+      state: stackState([
+        stackLink({ branch: "root", parent: "dev", anchor: "dev-old", pr: 1 }),
+        stackLink({ branch: "child", parent: "root", anchor: "root-old", pr: 2 }),
+      ]),
+      service: {
+        commits: (from, branch) =>
+          Effect.succeed(from === "root-old" && branch === "child" ? ["child-only"] : []),
+        novel: (_parent, _branch, commits) => Effect.succeed(commits),
+        replay: (branch, parent, commits) =>
+          Effect.sync(() => seen.push(`${branch}:${parent}:${commits.join(",")}`)),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ apply: true, branch: "child" });
+
+      expect(seen).toEqual(["child:root:child-only"]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("undo restores the last applied mutation", () => {
     const test = makeSync();
 
@@ -3509,6 +3642,50 @@ describe("Stack", () => {
           }).pipe(Effect.provide(doneTest.layer)),
         ),
       );
+  });
+
+  it.effect("land bounds descendant repair depth and preserves deeper links", () => {
+    const planTest = makeLand();
+    const doneTest = makeLand();
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const plan = yield* stack.land("stack-a", { repairDepth: 1 });
+
+      expect(plan).toContain("would rebase stack-b onto dev");
+      expect(plan).not.toContain("would rebase stack-c onto stack-b");
+    })
+      .pipe(Effect.provide(planTest.layer))
+      .pipe(
+        Effect.flatMap(() =>
+          Effect.gen(function* () {
+            const stack = yield* Stack;
+            const store = yield* Store;
+            const done = yield* stack.land("stack-a", { apply: true, repairDepth: 1 });
+            const state = yield* store.read();
+
+            expect(done.join("\n")).toContain("stack-b #5");
+            expect(done.join("\n")).not.toContain("stack-c #3");
+            expect(doneTest.seen).toContain("rebase stack-b origin/dev");
+            expect(doneTest.seen).not.toContain("rebase stack-c stack-b");
+            expect(state.links.find((item) => item.branch === "stack-b")?.parent).toBe("dev");
+            expect(state.links.find((item) => item.branch === "stack-c")?.parent).toBe("stack-b");
+          }).pipe(Effect.provide(doneTest.layer)),
+        ),
+      );
+  });
+
+  it.effect("land rejects a non-positive repair depth", () => {
+    const test = makeLand();
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const error = yield* Effect.flip(stack.land("stack-a", { repairDepth: 0 }));
+
+      expect(error).toBeInstanceOf(StackOperationError);
+      expect(error.message).toContain("--repair-depth must be a positive integer");
+      expect(test.seen).toEqual([]);
+    }).pipe(Effect.provide(test.layer));
   });
 
   it.effect("land journals child retargets before a failed root merge", () => {

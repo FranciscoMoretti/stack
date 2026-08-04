@@ -49,6 +49,7 @@ export interface StackService {
       readonly auto?: boolean;
       readonly admin?: boolean;
       readonly through?: string;
+      readonly repairDepth?: number;
     },
   ) => Effect.Effect<ReadonlyArray<string>, StackError>;
   readonly sync: (opts?: {
@@ -325,7 +326,11 @@ ${note}`;
         return lines;
       };
 
-      const scopedBranches = (state: ReturnType<typeof stackState>, root: string) => {
+      const scopedBranches = (
+        state: ReturnType<typeof stackState>,
+        root: string,
+        maxDepth?: number,
+      ) => {
         const children = new Map<string, Array<string>>();
         for (const link of state.links) {
           const parent = String(link.parent);
@@ -335,12 +340,13 @@ ${note}`;
         }
 
         const branches = new Set<string>();
-        const visit = (branch: string) => {
+        const visit = (branch: string, depth: number) => {
           if (branches.has(branch)) return;
           branches.add(branch);
-          for (const child of children.get(branch) ?? []) visit(child);
+          if (maxDepth !== undefined && depth >= maxDepth) return;
+          for (const child of children.get(branch) ?? []) visit(child, depth + 1);
         };
-        visit(root);
+        visit(root, 0);
         return branches;
       };
 
@@ -569,7 +575,21 @@ ${note}`;
                 continue;
               }
 
-              const anchor = yield* git.base(branch, parent);
+              let anchor = yield* git.base(branch, parent);
+              if (!trunks.has(parent)) {
+                const remoteParent = `origin/${parent}`;
+                const [remoteHead, remoteBase] = yield* Effect.all([
+                  git.head(remoteParent),
+                  git.base(branch, remoteParent),
+                ]);
+                if (
+                  Option.isSome(remoteHead) &&
+                  Option.isSome(remoteBase) &&
+                  remoteHead.value === remoteBase.value
+                ) {
+                  anchor = remoteHead;
+                }
+              }
               if (Option.isNone(anchor)) continue;
 
               const action = stackLink({
@@ -705,6 +725,7 @@ ${note}`;
               state: ReturnType<typeof stackState>,
             ) => Effect.Effect<void, StackError>;
             readonly preserveUndo?: boolean;
+            readonly preserveTrunkRoots?: boolean;
           },
         ) =>
           Effect.gen(function* () {
@@ -746,7 +767,6 @@ ${note}`;
             const childBases = new Set(pulls.map((pull) => String(pull.base)));
             let remoteByRepository: Map<string, string> | null = null;
             const tips = new Map<string, string | null>();
-            const prior = new Map<string, string>();
             const moved = new Set<string>();
             const entries: Array<UndoEntry> = Array.from(opts.initialEntries ?? []);
             const next: Array<StackLink> = [];
@@ -785,24 +805,6 @@ ${note}`;
               if (childBases.has(branch)) remotes.add("origin");
               return [...remotes];
             });
-
-            const backups = refs
-              .map((ref) => ref.name)
-              .filter(
-                (name) =>
-                  name.startsWith("backup/landed-") || name.startsWith("backup/stack-sync-"),
-              )
-              .sort();
-            const landedBackupHeads = new Set(
-              refs
-                .filter((ref) => ref.name.startsWith("backup/landed-"))
-                .map((ref) => String(ref.head)),
-            );
-            for (const name of backups) {
-              for (const link of state.links) {
-                if (name.endsWith(`-${link.branch}`)) prior.set(String(link.branch), name);
-              }
-            }
 
             const checkpoint = Effect.fn("Stack.repairStack.checkpoint")(() =>
               apply
@@ -903,22 +905,21 @@ ${note}`;
 
               const pr = prs.get(String(link.branch)) ?? null;
               const onto = trunk(parent) ? `origin/${parent}` : parent;
-              const from =
-                saved.get(String(link.parent)) ??
-                (live.has(String(link.parent))
-                  ? String(link.parent)
-                  : (prior.get(String(link.parent)) ?? String(link.parent)));
               if (!tips.has(onto)) {
                 const tip = yield* git.head(onto);
                 tips.set(onto, Option.isSome(tip) ? tip.value : null);
               }
               const want = tips.get(onto) ?? heads.get(parent) ?? null;
               const have = yield* git.base(link.branch, onto);
+              const ancestryDrift =
+                !(trunk(parent) && opts.preserveTrunkRoots === true) &&
+                want &&
+                (Option.isNone(have) || have.value !== want);
               const drift =
                 replayAnchors.has(String(link.branch)) ||
                 parent !== link.parent ||
                 (!apply && moved.has(parent)) ||
-                (want && (Option.isNone(have) || have.value !== want));
+                ancestryDrift;
               const base = pr?.base ?? null;
               let backup: string | null = null;
               let created: number | null = null;
@@ -942,12 +943,8 @@ ${note}`;
                   headRepository,
                   pr ? Number(pr.number) : link.pr ? Number(link.pr) : null,
                 );
-                const landedAnchor =
-                  trunk(parent) && landedBackupHeads.has(String(link.anchor))
-                    ? String(link.anchor)
-                    : null;
-                const anchor = replayAnchors.get(String(link.branch)) ?? landedAnchor;
-                const baseRef = anchor ? Option.some(anchor) : yield* git.base(link.branch, from);
+                const anchor = replayAnchors.get(String(link.branch)) ?? String(link.anchor);
+                const baseRef = Option.some(anchor);
                 const commitsToReplay = Option.isSome(baseRef)
                   ? yield* Effect.gen(function* () {
                       const commits = yield* git.commits(baseRef.value, link.branch);
@@ -1236,6 +1233,10 @@ ${note}`;
                     initialActions: scopedInitial,
                     ...(writeState ? { writeState } : {}),
                     preserveUndo,
+                    preserveTrunkRoots:
+                      requestedBranch !== undefined &&
+                      target !== null &&
+                      requestedBranch !== target.root,
                   });
                   const changedOpenPulls = repair.actions.some(
                     (action) => action._tag === "RetargetPull" || action._tag === "CreatePull",
@@ -1597,12 +1598,14 @@ ${note}`;
             readonly auto?: boolean;
             readonly admin?: boolean;
             readonly through?: string;
+            readonly repairDepth?: number;
           },
         ) =>
           Effect.gen(function* () {
             const apply = opts?.apply ?? false;
             const auto = opts?.auto ?? false;
             const admin = opts?.admin ?? false;
+            const repairDepth = opts?.repairDepth;
             if (apply && auto) {
               return yield* Effect.fail(
                 new StackOperationError("use either --apply or --auto, not both"),
@@ -1614,6 +1617,11 @@ ${note}`;
             if (admin && !codeHost.capabilities.adminMerge) {
               return yield* Effect.fail(
                 new StackOperationError(`--admin is not supported by ${codeHost.provider}`),
+              );
+            }
+            if (repairDepth !== undefined && (!Number.isInteger(repairDepth) || repairDepth < 1)) {
+              return yield* Effect.fail(
+                new StackOperationError("--repair-depth must be a positive integer"),
               );
             }
             const active = apply || auto;
@@ -1638,7 +1646,7 @@ ${note}`;
               );
             }
 
-            const branches = scopedBranches(state, target);
+            const branches = scopedBranches(state, target, repairDepth);
             const scopedState = filterState(state, branches);
 
             const pr = yield* changeForLink(link, pulls);
@@ -1871,7 +1879,12 @@ ${note}`;
 
           for (const target of chain) {
             if (items.length > 0) items.push("");
-            items.push(...(yield* landOne(target, { auto: true })));
+            items.push(
+              ...(yield* landOne(target, {
+                auto: true,
+                ...(opts.repairDepth === undefined ? {} : { repairDepth: opts.repairDepth }),
+              })),
+            );
           }
 
           items.push(`merged through: ${stop}`);

@@ -47,6 +47,13 @@ const through = Flag.string("through").pipe(
   Flag.optional,
 );
 
+const repairDepth = Flag.integer("repair-depth").pipe(
+  Flag.withDescription(
+    "Limit root-merge repair to this many descendant layers. The immediate child is depth 1.",
+  ),
+  Flag.optional,
+);
+
 const continueOnFailure = Flag.boolean("continue-on-failure").pipe(
   Flag.withAlias("keep-going"),
   Flag.withDescription(
@@ -176,21 +183,24 @@ const mergeCommand = Command.make(
     auto,
     admin,
     through,
+    repairDepth,
   },
-  Effect.fn(function* ({ branch, apply, auto, admin, through }) {
+  Effect.fn(function* ({ branch, apply, auto, admin, through, repairDepth }) {
     const stack = yield* Stack;
     const throughValue = Option.getOrUndefined(through);
+    const repairDepthValue = Option.getOrUndefined(repairDepth);
     const items = yield* stack.land(Option.getOrUndefined(branch), {
       apply,
       auto,
       admin,
       ...(throughValue === undefined ? {} : { through: throughValue }),
+      ...(repairDepthValue === undefined ? {} : { repairDepth: repairDepthValue }),
     });
     yield* Console.log(items.join("\n"));
   }),
 ).pipe(
   Command.withDescription(
-    "Merge the oldest branch in a stack, preserve a local backup branch, repair descendants, and print the next root branch. If branch is omitted, infer the root from the current branch. By default this is a dry run. Add --apply to merge immediately, --apply --admin to force with admin privileges (GitHub only), or --auto to enable code-host auto-merge and wait until it lands before repairing descendants. Add --auto --through <branch-or-change> for a bounded range.",
+    "Merge the oldest branch in a stack, preserve a local backup branch, repair descendants, and print the next root branch. If branch is omitted, infer the root from the current branch. By default this is a dry run. Add --repair-depth <n> to bound repair to n descendant layers. Add --apply to merge immediately, --apply --admin to force with admin privileges (GitHub only), or --auto to enable code-host auto-merge and wait until it lands before repairing descendants. Add --auto --through <branch-or-change> for a bounded range.",
   ),
   Command.withExamples([
     {
@@ -204,6 +214,10 @@ const mergeCommand = Command.make(
     {
       command: "stack merge effectify-watcher --apply",
       description: "Merge the root change, repair descendants, and print the next root branch",
+    },
+    {
+      command: "stack merge effectify-watcher --repair-depth 2",
+      description: "Preview the root plus at most two descendant repair layers",
     },
     {
       command: "stack merge effectify-watcher --auto",

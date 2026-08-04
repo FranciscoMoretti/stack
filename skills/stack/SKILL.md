@@ -72,6 +72,8 @@ work. Repeat after any parent branch changes or a squash merge lands.
   report successes and failures, exit nonzero if any failed.
 - `stack merge [branch]` — dry-run root merge plus descendant repair. Infers
   the root from the current branch.
+- `stack merge [branch] --repair-depth 2` — limit the preview and repair to the
+  root plus two descendant layers. Deeper tracked links remain untouched.
 - `stack merge --apply` — retarget child changes, squash-merge the root, repair
   descendants.
 - `stack merge --auto` — retarget children, enable code-host auto-merge, wait,
