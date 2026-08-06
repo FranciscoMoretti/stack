@@ -685,6 +685,31 @@ ${note}`;
                   continue;
                 }
               }
+              if (!trunks.has(parent) && refNames.has(parent)) {
+                const [parentHead, embeddedParent] = yield* Effect.all([
+                  git.head(parent),
+                  git.base(branch, parent),
+                ]);
+                if (
+                  Option.isSome(parentHead) &&
+                  Option.isSome(embeddedParent) &&
+                  parentHead.value === embeddedParent.value &&
+                  link.anchor !== embeddedParent.value
+                ) {
+                  reconciled.push(
+                    stackLink({
+                      branch,
+                      parent,
+                      anchor: embeddedParent.value,
+                      pr: link.pr,
+                      ...(link.headRepository !== undefined
+                        ? { headRepository: link.headRepository }
+                        : {}),
+                    }),
+                  );
+                  continue;
+                }
+              }
               reconciled.push(link);
             }
 

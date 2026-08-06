@@ -3229,6 +3229,68 @@ describe("Stack", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("sync refreshes a stale child anchor before retargeting its parent", () => {
+    const seen: Array<string> = [];
+    const refs = new Map([
+      ["dev", ref("dev", "dev-head")],
+      ["root", ref("root", "root-old-tip")],
+      ["child", ref("child", "child-old-tip")],
+    ]);
+    const baseMap = new Map([
+      ["root:dev", "dev-old"],
+      ["root:origin/dev", "dev-old"],
+      ["child:root", "root-old-tip"],
+    ]);
+    const pulls = [pr(1, "root", "dev"), pr(2, "child", "root")];
+    const layer = stackTestLayer({
+      current: "child",
+      refs: [...refs.values()],
+      pulls,
+      state: stackState([
+        stackLink({ branch: "root", parent: "legacy", anchor: "legacy-anchor", pr: 1 }),
+        stackLink({ branch: "child", parent: "root", anchor: "stale-child-anchor", pr: 2 }),
+      ]),
+      service: {
+        refs: () => Effect.succeed([...refs.values()]),
+        head: (name) =>
+          Effect.succeed(
+            Option.fromNullishOr(
+              refs.get(name)?.head ??
+                (name.startsWith("origin/") ? refs.get(name.slice(7))?.head : undefined),
+            ),
+          ),
+        base: (branch, parent) =>
+          Effect.succeed(Option.fromNullishOr(baseMap.get(`${branch}:${parent}`))),
+        commits: (from, branch) =>
+          Effect.succeed(
+            branch === "root" && from === "legacy-anchor"
+              ? ["root-only"]
+              : branch === "child" && from === "root-old-tip"
+                ? ["child-only"]
+                : branch === "child" && from === "stale-child-anchor"
+                  ? ["legacy-parent", "root-only", "child-only"]
+                  : [],
+          ),
+        novel: (_parent, _branch, commits) => Effect.succeed(commits),
+        replay: (branch, parent, commits) =>
+          Effect.sync(() => {
+            seen.push(`${branch}:${commits.join(",")}`);
+            const repairedHead = `${branch}-repaired`;
+            refs.set(branch, ref(branch, repairedHead));
+            baseMap.set(`${branch}:${parent}`, refs.get(parent)?.head ?? "");
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ apply: true });
+
+      expect(seen).toEqual(["root:root-only", "child:child-only"]);
+      expect(seen.join(",")).not.toContain("legacy-parent");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("sync leaves a clean root alone when only the trunk advanced", () => {
     const seen: Array<string> = [];
     const layer = stackTestLayer({
