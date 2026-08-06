@@ -2468,6 +2468,24 @@ describe("Stack", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("branch-scoped sync preview preserves its scope in the apply command", () => {
+    const layer = stackTestLayer({
+      current: "dev",
+      refs: [ref("dev", "aaa"), ref("app-root", "app"), ref("app-child", "app-child")],
+      pulls: [pr(1, "app-root", "dev"), pr(2, "app-child", "app-root")],
+      bases: bases(["app-root", "dev", "aaa"], ["app-child", "app-root", "app"]),
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const items = yield* stack.sync({ branch: "app-child" });
+
+      expect(items).toContain("Apply:");
+      expect(items).toContain("  stack sync app-child --apply");
+      expect(items).not.toContain("  stack sync --apply");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("sync without branch scopes to the current inferred stack", () => {
     const layer = stackTestLayer({
       current: "other-child",

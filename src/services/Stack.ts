@@ -197,6 +197,7 @@ ${note}`;
         readonly pulls: ReadonlyArray<PullRef>;
         readonly actions: ReadonlyArray<StackResult.StackResultItem>;
         readonly mode: StackResult.Mode;
+        readonly applyCommand?: string;
         readonly failed?: { readonly branch: string; readonly parent: string };
       }) => {
         const trunkNames = cfg.trunks.map(String);
@@ -319,8 +320,9 @@ ${note}`;
         }
         if (backups > 0 && opts.mode === "apply") summary.push(`Backups created: ${backups}`);
         if (summary.length > 0) lines.push("", ...summary);
-        if (opts.mode === "dry-run") lines.push("", "Apply:", "  stack sync --apply");
-        else if (!opts.failed && (backups > 0 || updatedPrs.size > 0)) {
+        if (opts.mode === "dry-run") {
+          lines.push("", "Apply:", `  ${opts.applyCommand ?? "stack sync --apply"}`);
+        } else if (!opts.failed && (backups > 0 || updatedPrs.size > 0)) {
           lines.push("", "Undo:", "  stack undo --apply");
         }
         return lines;
@@ -1272,6 +1274,9 @@ ${note}`;
                   );
                   const notes = yield* linksFor(repair.state, !dryRun, new Set(), notesPulls);
                   const changed = repair.actions.length > 0 || notes.actions.length > 0;
+                  const applyCommand = requestedBranch
+                    ? `stack sync ${requestedBranch} --apply`
+                    : "stack sync --apply";
                   const lines = !changed
                     ? renderSyncTree({
                         title: "Stack is current",
@@ -1279,6 +1284,7 @@ ${note}`;
                         pulls: scopedPulls,
                         actions: [],
                         mode,
+                        applyCommand,
                       })
                     : renderSyncTree({
                         title: dryRun ? "Sync preview" : "Synced stack",
@@ -1286,6 +1292,7 @@ ${note}`;
                         pulls: scopedPulls,
                         actions: [...repair.actions, ...notes.actions],
                         mode,
+                        applyCommand,
                       });
                   return { lines, undo: repair.undo };
                 }),
