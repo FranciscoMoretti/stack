@@ -2220,6 +2220,60 @@ describe("Stack", () => {
     }).pipe(Effect.provide(make())),
   );
 
+  it.effect("adopt accepts an explicit ancestral replay anchor", () => {
+    const layer = stackTestLayer({
+      current: "child",
+      refs: [ref("dev", "dev-head"), ref("parent", "parent-new"), ref("child", "child-head")],
+      pulls: [pr(1, "parent", "dev"), pr(2, "child", "parent")],
+      bases: bases(["child", "parent", "shared-base"], ["child", "parent-old", "parent-old"]),
+      service: {
+        head: (name) =>
+          Effect.succeed(
+            Option.fromNullishOr(
+              name === "parent-old"
+                ? "parent-old"
+                : name === "parent-new"
+                  ? "parent-new"
+                  : name === "child"
+                    ? "child-head"
+                    : undefined,
+            ),
+          ),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const store = yield* Store;
+      const link = yield* stack.adopt("child", "parent", "parent-old");
+
+      expect(link.anchor).toBe("parent-old");
+      expect((yield* store.read()).links.find((item) => item.branch === "child")?.anchor).toBe(
+        "parent-old",
+      );
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("adopt rejects an explicit replay anchor outside the branch", () => {
+    const layer = stackTestLayer({
+      current: "child",
+      refs: [ref("dev", "dev-head"), ref("parent", "parent-new"), ref("child", "child-head")],
+      pulls: [pr(1, "parent", "dev"), pr(2, "child", "parent")],
+      bases: bases(["child", "parent", "shared-base"], ["child", "unrelated", "shared-base"]),
+      service: {
+        head: (name) =>
+          Effect.succeed(Option.fromNullishOr(name === "unrelated" ? name : undefined)),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const error = yield* Effect.flip(stack.adopt("child", "parent", "unrelated"));
+
+      expect(String(error)).toContain("unrelated is not an ancestor of child");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("adopt rejects trunk, self-parent, and cyclic links", () =>
     Effect.gen(function* () {
       const stack = yield* Stack;

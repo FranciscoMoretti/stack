@@ -40,7 +40,11 @@ import { Store } from "./Store.ts";
 
 export interface StackService {
   readonly status: () => Effect.Effect<StatusReport, StackError>;
-  readonly adopt: (branch: string, parent: string) => Effect.Effect<StackLink, StackError>;
+  readonly adopt: (
+    branch: string,
+    parent: string,
+    anchor?: string,
+  ) => Effect.Effect<StackLink, StackError>;
   readonly links: (apply?: boolean) => Effect.Effect<ReadonlyArray<string>, StackError>;
   readonly land: (
     branch?: string,
@@ -468,7 +472,7 @@ ${note}`;
         return ["", "Stack", renderDiagram(scopedReport, reference)];
       });
 
-      const adopt = Effect.fn("Stack.adopt")((branch: string, parent: string) =>
+      const adopt = Effect.fn("Stack.adopt")((branch: string, parent: string, anchor?: string) =>
         Effect.gen(function* () {
           const refs = yield* git.refs();
           if (trunk(branch)) {
@@ -489,6 +493,23 @@ ${note}`;
 
           const base = yield* git.base(branch, parent);
           if (Option.isNone(base)) return yield* Effect.fail(new MergeBaseError(branch, parent));
+          let replayAnchor = base.value;
+          if (anchor !== undefined) {
+            const [anchorHead, embeddedAnchor] = yield* Effect.all([
+              git.head(anchor),
+              git.base(branch, anchor),
+            ]);
+            if (
+              Option.isNone(anchorHead) ||
+              Option.isNone(embeddedAnchor) ||
+              anchorHead.value !== embeddedAnchor.value
+            ) {
+              return yield* Effect.fail(
+                new StackOperationError(`${anchor} is not an ancestor of ${branch}`),
+              );
+            }
+            replayAnchor = anchorHead.value;
+          }
 
           const [state, pulls] = yield* Effect.all([store.read(), codeHost.changes()]);
           const nextLinks = new Map(
@@ -516,7 +537,7 @@ ${note}`;
           const next = stackLink({
             branch,
             parent,
-            anchor: base.value,
+            anchor: replayAnchor,
             pr,
             headRepository: pull?.headRepository ?? null,
           });

@@ -102,10 +102,14 @@ const trackCommand = Command.make(
       Flag.withAlias("p"),
       Flag.withDescription("Parent branch this branch is stacked on"),
     ),
+    anchor: Flag.string("anchor").pipe(
+      Flag.optional,
+      Flag.withDescription("Existing commit after which this branch's own commits begin"),
+    ),
   },
-  Effect.fn(function* ({ branch, onto }) {
+  Effect.fn(function* ({ branch, onto, anchor }) {
     const stack = yield* Stack;
-    const link = yield* stack.adopt(branch, onto);
+    const link = yield* stack.adopt(branch, onto, Option.getOrUndefined(anchor));
     yield* Console.log(`track ${link.branch} onto ${link.parent} @ ${link.anchor}`);
   }),
 ).pipe(
@@ -116,6 +120,10 @@ const trackCommand = Command.make(
     {
       command: "stack track stack-c --onto stack-b",
       description: "Record that stack-c is stacked on stack-b",
+    },
+    {
+      command: "stack track stack-c --onto stack-b --anchor abc123",
+      description: "Preserve the old parent boundary after repairing stack-b manually",
     },
   ]),
 );
