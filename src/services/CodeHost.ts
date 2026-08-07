@@ -1,11 +1,20 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import type * as Option from "effect/Option";
 import type { CodeHostError, PullMeta, PullRef } from "../domain/model.ts";
 
 export type Provider = "github" | "gitlab";
 
 export interface Capabilities {
   readonly adminMerge: boolean;
+}
+
+export interface ReplayBase {
+  readonly branch: string;
+  readonly currentBase: string;
+  readonly head: string;
+  readonly fetchRef: string;
+  readonly change: number;
 }
 
 export interface Interface {
@@ -23,6 +32,10 @@ export interface Interface {
   readonly wait: (pr: number) => Effect.Effect<void, CodeHostError>;
   readonly changes: () => Effect.Effect<ReadonlyArray<PullRef>, CodeHostError>;
   readonly change: (number: number) => Effect.Effect<PullMeta, CodeHostError>;
+  readonly replayBase: (
+    number: number,
+    currentBase: string,
+  ) => Effect.Effect<Option.Option<ReplayBase>, CodeHostError>;
   readonly edit: (pr: number, base: string) => Effect.Effect<void, CodeHostError>;
   readonly body: (pr: number, body: string) => Effect.Effect<void, CodeHostError>;
   readonly close: (pr: number) => Effect.Effect<void, CodeHostError>;

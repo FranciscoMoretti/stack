@@ -23,6 +23,7 @@ export interface Interface {
   readonly dirty: () => Effect.Effect<ReadonlyArray<string>, ExecError>;
   readonly worktrees: () => Effect.Effect<ReadonlyArray<Worktree>, ExecError>;
   readonly fetch: () => Effect.Effect<void, ExecError>;
+  readonly fetchRef: (ref: string) => Effect.Effect<string, ExecError>;
   readonly remotes: () => Effect.Effect<
     ReadonlyArray<{ readonly name: string; readonly url: string }>,
     ExecError
@@ -201,6 +202,10 @@ export const live = Layer.effect(
     const fetch = Effect.fn("Git.fetch")(() =>
       run("git", ["fetch", "origin", "--prune"]).pipe(Effect.asVoid),
     );
+    const fetchRef = Effect.fn("Git.fetchRef")(function* (ref: string) {
+      yield* run("git", ["fetch", "origin", "--no-tags", ref]);
+      return yield* run("git", ["rev-parse", "FETCH_HEAD"]);
+    });
     const remotes = Effect.fn("Git.remotes")(() =>
       run("git", ["config", "--get-regexp", "^remote\\..*\\.(push)?url$"], [0, 1]).pipe(
         Effect.map((out) => {
@@ -394,6 +399,7 @@ export const live = Layer.effect(
     );
     return Service.of({
       fetch,
+      fetchRef,
       remotes,
       dirty,
       worktrees,
@@ -428,6 +434,7 @@ export const test = (opts: {
     Service,
     Service.of({
       fetch: () => Effect.void,
+      fetchRef: (ref) => Effect.succeed(opts.refs?.find((item) => item.name === ref)?.head ?? ref),
       dirty: () => Effect.succeed([]),
       worktrees: () => Effect.succeed([]),
       refs: () => Effect.succeed(opts.refs ?? []),

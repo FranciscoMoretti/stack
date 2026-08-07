@@ -274,6 +274,26 @@ export class CodeHostChangeNotFoundError extends Schema.TaggedErrorClass<CodeHos
   }
 }
 
+export class CodeHostReplayBaseNotFoundError extends Schema.TaggedErrorClass<CodeHostReplayBaseNotFoundError>()(
+  "CodeHostReplayBaseNotFoundError",
+  {
+    number: Schema.Number,
+    branch: Schema.String,
+    message: Schema.String,
+  },
+) {
+  constructor(
+    readonly number: number,
+    readonly branch: string,
+  ) {
+    super({
+      number,
+      branch,
+      message: `cannot recover the merged change for previous base ${branch} of change ${number}`,
+    });
+  }
+}
+
 export class UnsupportedCodeHostOperation extends Schema.TaggedErrorClass<UnsupportedCodeHostOperation>()(
   "UnsupportedCodeHostOperation",
   {
@@ -295,11 +315,13 @@ export type CodeHostError =
   | ExecError
   | CodeHostDecodeError
   | CodeHostChangeNotFoundError
+  | CodeHostReplayBaseNotFoundError
   | UnsupportedCodeHostOperation;
 export type StackError =
   | ExecError
   | CodeHostDecodeError
   | CodeHostChangeNotFoundError
+  | CodeHostReplayBaseNotFoundError
   | UnsupportedCodeHostOperation
   | StateError
   | BranchError

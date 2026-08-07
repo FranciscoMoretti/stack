@@ -885,7 +885,25 @@ ${note}`;
               const anchor = replayAnchors.get(branch) ?? String(link.anchor);
               const all = yield* git.commits(anchor, branch);
               const savedParent = saved.get(String(link.parent));
-              const candidates = savedParent ? [savedParent] : trunk(parent) ? landedBackups : [];
+              const candidates = savedParent
+                ? [savedParent]
+                : trunk(parent)
+                  ? Array.from(landedBackups)
+                  : [];
+              if (!savedParent && trunk(parent) && link.pr) {
+                const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
+                if (Option.isSome(recovered)) {
+                  const fetchedHead = yield* git.fetchRef(recovered.value.fetchRef);
+                  if (fetchedHead !== recovered.value.head) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `fetched ${recovered.value.fetchRef} at ${fetchedHead}, expected ${recovered.value.head}`,
+                      ),
+                    );
+                  }
+                  candidates.push(recovered.value.head);
+                }
+              }
               let selected = all;
               let matchedParentPrefix = 0;
 

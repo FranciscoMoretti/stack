@@ -81,6 +81,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     dirty: () => Effect.succeed([]),
     worktrees: () => Effect.succeed([]),
     fetch: () => Effect.void,
+    fetchRef: (ref) => Effect.succeed(ref),
     remotes: () => Effect.succeed([]),
     refs: () => Effect.succeed([]),
     current: () => Effect.succeed(""),
@@ -111,6 +112,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     wait: () => Effect.void,
     changes: () => Effect.succeed([]),
     change: (number) => Effect.fail(new CodeHostChangeNotFoundError(number)),
+    replayBase: () => Effect.succeed(Option.none()),
     edit: () => Effect.void,
     body: () => Effect.void,
     close: () => Effect.void,
@@ -209,6 +211,7 @@ const integrationGitHub = (opts: {
   readonly pulls: ReadonlyArray<ReturnType<typeof pullRef>>;
   readonly metas: ReadonlyArray<ReturnType<typeof pullMeta>>;
   readonly log: Array<string>;
+  readonly replayBases?: ReadonlyMap<number, CodeHost.ReplayBase>;
 }) =>
   Layer.effect(
     CodeHost.Service,
@@ -338,6 +341,12 @@ const integrationGitHub = (opts: {
         wait: (pr) => record(`wait ${pr}`),
         changes: listOpen,
         change: getPull,
+        replayBase: (pr, currentBase) => {
+          const value = opts.replayBases?.get(pr);
+          return Effect.succeed(
+            value?.currentBase === currentBase ? Option.some(value) : Option.none(),
+          );
+        },
         edit,
         body: updateBody,
         close: (pr) => Ref.update(pulls, (items) => items.filter((item) => item.number !== pr)),
@@ -1575,9 +1584,106 @@ describe("Git", () => {
       ]);
     }).pipe(Effect.provide(Git.live.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))));
   });
+
+  it.effect("fetches a durable code-host ref and returns its exact head", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            return args[0] === "rev-parse" ? "parent-head" : "";
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const git = yield* Git.Service;
+      const head = yield* git.fetchRef("refs/pull/100/head");
+
+      expect(head).toBe("parent-head");
+      expect(calls).toEqual([
+        ["git", "fetch", "origin", "--no-tags", "refs/pull/100/head"],
+        ["git", "rev-parse", "FETCH_HEAD"],
+      ]);
+    }).pipe(Effect.provide(Git.live.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))));
+  });
 });
 
 describe("GitHub", () => {
+  it.effect("recovers the exact landed parent head from a base-change event", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
+            if (args[0] === "api") {
+              return JSON.stringify({
+                data: {
+                  repository: {
+                    pullRequest: {
+                      timelineItems: {
+                        nodes: [
+                          {
+                            createdAt: "2026-08-07T07:44:01Z",
+                            previousRefName: "landed-parent",
+                            currentRefName: "main",
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              });
+            }
+            return JSON.stringify([
+              {
+                number: 100,
+                headRefName: "landed-parent",
+                headRefOid: "exact-parent-head",
+                mergedAt: "2026-08-07T07:44:04Z",
+              },
+            ]);
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const replayBase = yield* github.replayBase(101, "main");
+
+      expect(Option.getOrUndefined(replayBase)).toEqual({
+        branch: "landed-parent",
+        currentBase: "main",
+        head: "exact-parent-head",
+        fetchRef: "refs/pull/100/head",
+        change: 100,
+      });
+      expect(calls).toHaveLength(3);
+      expect(calls[0]).toEqual(["gh", "repo", "view", "--json", "nameWithOwner"]);
+      expect(calls[1]).toContain("number=101");
+      expect(calls[2]).toEqual([
+        "gh",
+        "pr",
+        "list",
+        "--state",
+        "merged",
+        "--head",
+        "landed-parent",
+        "--json",
+        "number,headRefName,headRefOid,mergedAt",
+        "--limit",
+        "100",
+      ]);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
   it.effect("wait polls with the configured interval", () => {
     const calls: Array<ReadonlyArray<string>> = [];
     let views = 0;
@@ -3269,6 +3375,187 @@ describe("Stack", () => {
       expect(seen).not.toContain("rebase child origin/dev parent-1,parent-2,child-only");
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect(
+    "sync recovers a deleted landed parent from durable host state in a fresh clone",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const repo = join(root, "fresh");
+        const log: Array<string> = [];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+
+        yield* commitFile(author, "base.txt", "base\n", "base");
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+        const anchor = yield* shell(author, "git", ["rev-parse", "main"]);
+
+        const sharedParentBody = Array.from({ length: 20 }, (_, index) => `shared-${index}`).join(
+          "\n",
+        );
+        yield* shell(author, "git", ["checkout", "-b", "landed-parent", "main"]);
+        yield* commitFile(
+          author,
+          "parent.txt",
+          `${sharedParentBody}\nparent-v2\n`,
+          "landed parent semantic layer",
+        );
+        const landedParentHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "landed-parent"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root", "main"]);
+        yield* commitFile(
+          author,
+          "parent.txt",
+          `${sharedParentBody}\nparent-v1\n`,
+          "inherited parent semantic layer",
+        );
+        const inheritedParentCommit = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* commitFile(author, "cleanup.txt", "cleanup\n", "root cleanup layer");
+        const originalRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "child"]);
+        yield* commitFile(author, "child.txt", "child\n", "immediate child layer");
+        const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "grandchild.txt", "grandchild\n", "deeper descendant layer");
+        const originalGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(author, "git", ["checkout", "main"]);
+        yield* shell(author, "git", ["merge", "--squash", "landed-parent"]);
+        yield* shell(author, "git", ["commit", "-m", "squash landed parent"]);
+        yield* shell(author, "git", ["push", "origin", "main"]);
+        yield* shell(root, "git", [
+          "--git-dir",
+          origin,
+          "update-ref",
+          "refs/pull/100/head",
+          landedParentHead,
+        ]);
+        yield* shell(author, "git", ["push", "origin", "--delete", "landed-parent"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+        const unavailableParent = yield* Effect.flip(
+          shell(repo, "git", ["cat-file", "-e", `${landedParentHead}^{commit}`]),
+        );
+        expect(unavailableParent).toBeInstanceOf(ExecError);
+        expect(yield* shell(repo, "git", ["branch", "--list", "landed-parent"])).toBe("");
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo,
+              log,
+              pulls: [pr(101, "root", "main"), pr(102, "child", "root")],
+              metas: [
+                pullMeta({
+                  number: 101,
+                  title: "root cleanup",
+                  body: "",
+                  head: "root",
+                  base: "main",
+                  url: "u101",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+                pullMeta({
+                  number: 102,
+                  title: "immediate child",
+                  body: "",
+                  head: "child",
+                  base: "root",
+                  url: "u102",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+              ],
+              replayBases: new Map([
+                [
+                  101,
+                  {
+                    branch: "landed-parent",
+                    currentBase: "main",
+                    head: landedParentHead,
+                    fetchRef: "refs/pull/100/head",
+                    change: 100,
+                  },
+                ],
+              ]),
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({ branch: "root", parent: "main", anchor, pr: 101 }),
+                  stackLink({ branch: "child", parent: "root", anchor: originalRoot, pr: 102 }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.sync({ branch: "root" });
+          const applied = yield* stack.sync({ apply: true, branch: "root" });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+
+        const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+        const rootHead = yield* shell(repo, "git", ["rev-parse", "root"]);
+        const rootCommits = yield* shell(repo, "git", [
+          "rev-list",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          `${mainHead}..${rootHead}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("root #101 would rebase onto main");
+        expect(result.preview.join("\n")).toContain("child #102 would rebase onto root");
+        expect(result.applied.join("\n")).not.toContain("grandchild");
+        expect(rootCommits.split("\n").filter(Boolean)).toEqual([rootHead]);
+        expect(rootCommits).not.toContain(inheritedParentCommit);
+        expect(yield* shell(repo, "git", ["show", "-s", "--format=%s", rootHead])).toBe(
+          "root cleanup layer",
+        );
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/root"])).toBe(rootHead);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).not.toBe(originalChild);
+        expect(yield* shell(repo, "git", ["ls-remote", "origin", "refs/heads/grandchild"])).toBe(
+          `${originalGrandchild}\trefs/heads/grandchild`,
+        );
+        expect(yield* shell(repo, "git", ["cat-file", "-t", landedParentHead])).toBe("commit");
+        expect(log).not.toContain("body 103");
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
 
   it.effect(
     "sync does not record rebase or push when replay leaves the local head unchanged",

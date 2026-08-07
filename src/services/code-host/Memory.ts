@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import {
   CodeHostChangeNotFoundError,
@@ -19,6 +20,7 @@ export interface Options {
   readonly pulls?: ReadonlyArray<PullRef>;
   readonly metas?: ReadonlyArray<PullMeta>;
   readonly log?: Array<string>;
+  readonly replayBases?: ReadonlyMap<number, CodeHost.ReplayBase>;
 }
 
 export const layer = (opts: Options) =>
@@ -64,6 +66,15 @@ export const layer = (opts: Options) =>
         const made = metaFor(found);
         yield* Ref.update(metasRef, (metas) => new Map(metas).set(pr, made));
         return made;
+      });
+      const replayBase = Effect.fn("CodeHost.memory.replayBase")((
+        pr: number,
+        currentBase: string,
+      ) => {
+        const value = opts.replayBases?.get(pr);
+        return Effect.succeed(
+          value?.currentBase === currentBase ? Option.some(value) : Option.none(),
+        );
       });
       const edit = Effect.fn("CodeHost.memory.edit")((pr: number, base: string) =>
         Effect.gen(function* () {
@@ -211,6 +222,7 @@ export const layer = (opts: Options) =>
         wait,
         changes,
         change,
+        replayBase,
         edit,
         body,
         close,

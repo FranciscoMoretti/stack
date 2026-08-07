@@ -1,10 +1,12 @@
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import {
   ExecError,
   CodeHostChangeNotFoundError,
   CodeHostDecodeError,
+  CodeHostReplayBaseNotFoundError,
   PullLabel,
   pullMeta,
   PullMeta,
@@ -36,6 +38,41 @@ class PullWatch extends Schema.Class<PullWatch>("PullWatch")({
   state: Schema.String,
   mergedAt: Schema.NullOr(Schema.String),
 }) {}
+
+class RepositoryView extends Schema.Class<RepositoryView>("RepositoryView")({
+  nameWithOwner: Schema.String,
+}) {}
+
+class BaseRefChangedEvent extends Schema.Class<BaseRefChangedEvent>("BaseRefChangedEvent")({
+  createdAt: Schema.String,
+  previousRefName: Schema.String,
+  currentRefName: Schema.String,
+}) {}
+
+class BaseRefHistory extends Schema.Class<BaseRefHistory>("BaseRefHistory")({
+  data: Schema.Struct({
+    repository: Schema.NullOr(
+      Schema.Struct({
+        pullRequest: Schema.NullOr(
+          Schema.Struct({
+            timelineItems: Schema.Struct({
+              nodes: Schema.Array(Schema.NullOr(BaseRefChangedEvent)),
+            }),
+          }),
+        ),
+      }),
+    ),
+  }),
+}) {}
+
+class MergedPull extends Schema.Class<MergedPull>("MergedPull")({
+  number: Schema.Number,
+  headRefName: Schema.String,
+  headRefOid: Schema.String,
+  mergedAt: Schema.NullOr(Schema.String),
+}) {}
+
+const MergedPulls = Schema.Array(MergedPull);
 
 class PullListData extends Schema.Class<PullListData>("PullListData")({
   number: Schema.Number,
@@ -76,6 +113,24 @@ const decodePullView = (args: ReadonlyArray<string>, out: string) =>
 const decodePullWatch = (args: ReadonlyArray<string>, out: string) =>
   Effect.try({
     try: () => Schema.decodeUnknownSync(PullWatch)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodeRepositoryView = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(RepositoryView)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodeBaseRefHistory = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(BaseRefHistory)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodeMergedPulls = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(MergedPulls)(JSON.parse(extractJson(out))),
     catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
   });
 
@@ -158,6 +213,85 @@ export const layer = Layer.effect(
         Effect.flatMap((out) => decodePullView(args, out)),
         Effect.map(meta),
       );
+    });
+
+    const replayBase = Effect.fn("CodeHost.github.replayBase")(function* (
+      pr: number,
+      currentBase: string,
+    ) {
+      const repositoryArgs = ["repo", "view", "--json", "nameWithOwner"];
+      const repository = yield* run(repositoryArgs).pipe(
+        Effect.flatMap((out) => decodeRepositoryView(repositoryArgs, out)),
+      );
+      const [owner, name] = repository.nameWithOwner.split("/", 2);
+      if (!owner || !name) {
+        return yield* Effect.fail(
+          new CodeHostDecodeError(
+            "gh",
+            repositoryArgs,
+            repository.nameWithOwner,
+            "expected owner/name",
+          ),
+        );
+      }
+
+      const query =
+        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(first:100,itemTypes:[BASE_REF_CHANGED_EVENT]){nodes{... on BaseRefChangedEvent{createdAt previousRefName currentRefName}}}}}}";
+      const historyArgs = [
+        "api",
+        "graphql",
+        "-F",
+        `owner=${owner}`,
+        "-F",
+        `name=${name}`,
+        "-F",
+        `number=${pr}`,
+        "-f",
+        `query=${query}`,
+      ];
+      const history = yield* run(historyArgs).pipe(
+        Effect.flatMap((out) => decodeBaseRefHistory(historyArgs, out)),
+      );
+      const event = history.data.repository?.pullRequest?.timelineItems.nodes
+        .filter((item): item is BaseRefChangedEvent => item?.currentRefName === currentBase)
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+        .at(-1);
+      if (!event) return Option.none<CodeHost.ReplayBase>();
+
+      const mergedArgs = [
+        "pr",
+        "list",
+        "--state",
+        "merged",
+        "--head",
+        event.previousRefName,
+        "--json",
+        "number,headRefName,headRefOid,mergedAt",
+        "--limit",
+        "100",
+      ];
+      const merged = yield* run(mergedArgs).pipe(
+        Effect.flatMap((out) => decodeMergedPulls(mergedArgs, out)),
+      );
+      const eventTime = Date.parse(event.createdAt);
+      const parent = merged
+        .filter((item) => item.headRefName === event.previousRefName)
+        .sort((left, right) => {
+          const leftDistance = Math.abs(Date.parse(left.mergedAt ?? "") - eventTime);
+          const rightDistance = Math.abs(Date.parse(right.mergedAt ?? "") - eventTime);
+          return leftDistance - rightDistance || right.number - left.number;
+        })[0];
+      if (!parent) {
+        return yield* Effect.fail(new CodeHostReplayBaseNotFoundError(pr, event.previousRefName));
+      }
+
+      return Option.some({
+        branch: event.previousRefName,
+        currentBase,
+        head: parent.headRefOid,
+        fetchRef: `refs/pull/${parent.number}/head`,
+        change: parent.number,
+      });
     });
 
     const auto = Effect.fn("CodeHost.github.auto")((pr: number) =>
@@ -247,6 +381,7 @@ export const layer = Layer.effect(
       wait,
       changes,
       change,
+      replayBase,
       edit,
       body,
       close,

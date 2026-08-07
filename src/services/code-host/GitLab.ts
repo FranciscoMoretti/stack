@@ -1,6 +1,7 @@
 import * as Cache from "effect/Cache";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import {
   ExecError,
@@ -179,6 +180,10 @@ export const layer = Layer.effect(
       );
     });
 
+    const replayBase = Effect.fn("CodeHost.gitlab.replayBase")(() =>
+      Effect.succeed(Option.none<CodeHost.ReplayBase>()),
+    );
+
     const auto = Effect.fn("CodeHost.gitlab.auto")((pr: number) =>
       run([
         "api",
@@ -286,6 +291,7 @@ export const layer = Layer.effect(
       wait,
       changes,
       change,
+      replayBase,
       edit,
       body,
       close,
