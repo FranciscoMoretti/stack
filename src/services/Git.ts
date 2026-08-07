@@ -14,6 +14,11 @@ export interface Worktree {
   readonly dirty: ReadonlyArray<string>;
 }
 
+export interface SemanticCommits {
+  readonly commits: ReadonlyArray<string>;
+  readonly matchedParentPrefix: number;
+}
+
 export interface Interface {
   readonly dirty: () => Effect.Effect<ReadonlyArray<string>, ExecError>;
   readonly worktrees: () => Effect.Effect<ReadonlyArray<Worktree>, ExecError>;
@@ -35,6 +40,11 @@ export interface Interface {
     from: string,
     branch: string,
   ) => Effect.Effect<ReadonlyArray<string>, ExecError>;
+  readonly semanticCommits: (
+    anchor: string,
+    parent: string,
+    branch: string,
+  ) => Effect.Effect<SemanticCommits, ExecError>;
   readonly novel: (
     parent: string,
     branch: string,
@@ -51,6 +61,10 @@ export interface Interface {
   readonly drop: (branch: string) => Effect.Effect<void, ExecError>;
   readonly restore: (branch: string, name: string) => Effect.Effect<void, ExecError>;
   readonly push: (branch: string, remote?: string) => Effect.Effect<void, ExecError>;
+  readonly remoteHead: (
+    remote: string,
+    branch: string,
+  ) => Effect.Effect<Option.Option<string>, ExecError>;
 }
 
 export class Service extends Context.Service<Service, Interface>()("@stack/Git") {}
@@ -218,6 +232,38 @@ export const live = Layer.effect(
         `${from}..${branch}`,
       ]).pipe(Effect.map((out) => out.split("\n").filter(Boolean))),
     );
+    const semanticCommits = Effect.fn("Git.semanticCommits")(function* (
+      anchor: string,
+      parent: string,
+      branch: string,
+    ) {
+      const childCommits = yield* commits(anchor, branch);
+      if (childCommits.length === 0) {
+        return { commits: childCommits, matchedParentPrefix: 0 };
+      }
+
+      const rangeDiff = yield* run("git", [
+        "range-diff",
+        "--no-color",
+        "--no-patch",
+        `${anchor}..${parent}`,
+        `${anchor}..${branch}`,
+      ]);
+      const matched = new Set<number>();
+      for (const line of rangeDiff.split("\n")) {
+        const columns = line.match(/^\s*(\d+|-):\s+\S+\s+([<>=!])\s+(\d+|-):/);
+        if (!columns || columns[1] === "-" || columns[3] === "-") continue;
+        if (columns[2] !== "=" && columns[2] !== "!") continue;
+        matched.add(Number(columns[3]));
+      }
+
+      let matchedParentPrefix = 0;
+      while (matched.has(matchedParentPrefix + 1)) matchedParentPrefix += 1;
+      return {
+        commits: childCommits.slice(matchedParentPrefix),
+        matchedParentPrefix,
+      };
+    });
     const novel = Effect.fn("Git.novel")((
       parent: string,
       branch: string,
@@ -338,6 +384,14 @@ export const live = Layer.effect(
             Effect.asVoid,
           ),
     );
+    const remoteHead = Effect.fn("Git.remoteHead")((remote: string, branch: string) =>
+      run("git", ["ls-remote", "--heads", remote, `refs/heads/${branch}`]).pipe(
+        Effect.map((out) => {
+          const value = out.split(/\s+/, 1)[0];
+          return value ? Option.some(value) : Option.none<string>();
+        }),
+      ),
+    );
     return Service.of({
       fetch,
       remotes,
@@ -350,6 +404,7 @@ export const live = Layer.effect(
       head,
       base,
       commits,
+      semanticCommits,
       novel,
       replay,
       unmergedPaths,
@@ -358,6 +413,7 @@ export const live = Layer.effect(
       drop,
       restore,
       push,
+      remoteHead,
     });
   }),
 );
@@ -391,6 +447,8 @@ export const test = (opts: {
       base: (branch: string, parent: string) =>
         Effect.succeed(Option.fromNullishOr(opts.bases?.[`${branch}:${parent}`])),
       commits: () => Effect.succeed([]),
+      semanticCommits: (_anchor, _parent, _branch) =>
+        Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
       novel: (_parent, _branch, commits) => Effect.succeed(commits),
       replay: () => Effect.void,
       unmergedPaths: () => Effect.succeed([] as ReadonlyArray<string>),
@@ -399,6 +457,8 @@ export const test = (opts: {
       drop: () => Effect.void,
       restore: () => Effect.void,
       push: () => Effect.void,
+      remoteHead: (_remote, branch) =>
+        Effect.succeed(Option.fromNullishOr(opts.refs?.find((ref) => ref.name === branch)?.head)),
     }),
   );
 

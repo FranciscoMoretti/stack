@@ -813,6 +813,9 @@ ${note}`;
               );
             }
             const childBases = new Set(pulls.map((pull) => String(pull.base)));
+            const landedBackups = refs
+              .map((ref) => String(ref.name))
+              .filter((name) => name.startsWith("backup/landed-"));
             let remoteByRepository: Map<string, string> | null = null;
             const tips = new Map<string, string | null>();
             const moved = new Set<string>();
@@ -872,6 +875,40 @@ ${note}`;
             );
 
             if (journal) yield* checkpoint();
+
+            const commitsForReplay = Effect.fn("Stack.repairStack.commitsForReplay")(function* (
+              link: StackLink,
+              parent: string,
+              onto: string,
+            ) {
+              const branch = String(link.branch);
+              const anchor = replayAnchors.get(branch) ?? String(link.anchor);
+              const all = yield* git.commits(anchor, branch);
+              const savedParent = saved.get(String(link.parent));
+              const candidates = savedParent ? [savedParent] : trunk(parent) ? landedBackups : [];
+              let selected = all;
+              let matchedParentPrefix = 0;
+
+              for (const candidate of candidates) {
+                const [candidateHead, embeddedAnchor] = yield* Effect.all([
+                  git.head(candidate),
+                  git.base(candidate, anchor),
+                ]);
+                if (
+                  Option.isNone(candidateHead) ||
+                  candidateHead.value === anchor ||
+                  Option.isNone(embeddedAnchor) ||
+                  embeddedAnchor.value !== anchor
+                )
+                  continue;
+                const semantic = yield* git.semanticCommits(anchor, candidate, branch);
+                if (semantic.matchedParentPrefix <= matchedParentPrefix) continue;
+                selected = semantic.commits;
+                matchedParentPrefix = semantic.matchedParentPrefix;
+              }
+
+              return yield* git.novel(onto, branch, selected);
+            });
 
             const resolve = (name: string, seen = new Set<string>()): string | null => {
               let parent = name;
@@ -991,14 +1028,7 @@ ${note}`;
                   headRepository,
                   pr ? Number(pr.number) : link.pr ? Number(link.pr) : null,
                 );
-                const anchor = replayAnchors.get(String(link.branch)) ?? String(link.anchor);
-                const baseRef = Option.some(anchor);
-                const commitsToReplay = Option.isSome(baseRef)
-                  ? yield* Effect.gen(function* () {
-                      const commits = yield* git.commits(baseRef.value, link.branch);
-                      return yield* git.novel(onto, link.branch, commits);
-                    })
-                  : Array<string>();
+                const commitsToReplay = yield* commitsForReplay(link, parent, onto);
                 backup = `backup/stack-sync-${stamp}-${link.branch}`;
                 const rebase = {
                   branch: String(link.branch),
@@ -1008,7 +1038,8 @@ ${note}`;
                   commits: commitsToReplay,
                   pushRemotes: targetRemotes,
                 } satisfies RepairPlan.RebaseBranchPlan;
-                actions.push(...RepairPlan.rebaseBranch(rebase, mode));
+                const rebaseActions = RepairPlan.rebaseBranch(rebase, mode);
+                if (!apply) actions.push(...rebaseActions);
 
                 if (apply) {
                   const priorEntry = entries.find((item) => item.branch === link.branch) ?? null;
@@ -1027,6 +1058,10 @@ ${note}`;
                   yield* RepairExecution.applyRebaseBranch(rebase, {
                     git,
                     checkpoint,
+                    complete: (item) => {
+                      actions.push(item);
+                      return checkpoint();
+                    },
                     step,
                     onReplayFailure: (err) => replayFailure(rebase, err, state, pulls, actions),
                   });
@@ -1820,7 +1855,7 @@ ${note}`;
               scopedState,
               refs.filter((item) => item.name !== target),
               repairPulls,
-              { apply: false },
+              { apply: false, saved: new Map([[target, target]]) },
             );
             if (active) {
               yield* ensureRepairableWorktrees([
