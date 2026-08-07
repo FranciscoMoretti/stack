@@ -9,13 +9,24 @@ export interface Capabilities {
   readonly adminMerge: boolean;
 }
 
-export interface ReplayBase {
+export interface ReplayForcePushBoundary {
+  readonly kind: "force-push-boundary";
+  readonly currentBase: string;
+  readonly before: string;
+  readonly semanticHead: string;
+  readonly boundary: string;
+}
+
+export interface ReplayMergedParent {
+  readonly kind: "merged-parent";
   readonly branch: string;
   readonly currentBase: string;
   readonly head: string;
   readonly fetchRef: string;
   readonly change: number;
 }
+
+export type ReplayBase = ReplayForcePushBoundary | ReplayMergedParent;
 
 export interface Interface {
   readonly provider: Provider;

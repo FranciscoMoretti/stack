@@ -65,6 +65,37 @@ class BaseRefHistory extends Schema.Class<BaseRefHistory>("BaseRefHistory")({
   }),
 }) {}
 
+class ForcePushCommit extends Schema.Class<ForcePushCommit>("ForcePushCommit")({
+  oid: Schema.String,
+  parents: Schema.Struct({
+    nodes: Schema.Array(Schema.Struct({ oid: Schema.String })),
+  }),
+}) {}
+
+class HeadRefForcePushedEvent extends Schema.Class<HeadRefForcePushedEvent>(
+  "HeadRefForcePushedEvent",
+)({
+  createdAt: Schema.String,
+  beforeCommit: Schema.NullOr(ForcePushCommit),
+  afterCommit: Schema.NullOr(ForcePushCommit),
+}) {}
+
+class ForcePushHistory extends Schema.Class<ForcePushHistory>("ForcePushHistory")({
+  data: Schema.Struct({
+    repository: Schema.NullOr(
+      Schema.Struct({
+        pullRequest: Schema.NullOr(
+          Schema.Struct({
+            timelineItems: Schema.Struct({
+              nodes: Schema.Array(Schema.NullOr(HeadRefForcePushedEvent)),
+            }),
+          }),
+        ),
+      }),
+    ),
+  }),
+}) {}
+
 class MergedPull extends Schema.Class<MergedPull>("MergedPull")({
   number: Schema.Number,
   headRefName: Schema.String,
@@ -125,6 +156,12 @@ const decodeRepositoryView = (args: ReadonlyArray<string>, out: string) =>
 const decodeBaseRefHistory = (args: ReadonlyArray<string>, out: string) =>
   Effect.try({
     try: () => Schema.decodeUnknownSync(BaseRefHistory)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodeForcePushHistory = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(ForcePushHistory)(JSON.parse(extractJson(out))),
     catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
   });
 
@@ -235,6 +272,42 @@ export const layer = Layer.effect(
         );
       }
 
+      const forcePushQuery =
+        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(last:100,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt beforeCommit{oid parents(first:2){nodes{oid}}} afterCommit{oid parents(first:2){nodes{oid}}}}}}}}}";
+      const forcePushArgs = [
+        "api",
+        "graphql",
+        "-F",
+        `owner=${owner}`,
+        "-F",
+        `name=${name}`,
+        "-F",
+        `number=${pr}`,
+        "-f",
+        `query=${forcePushQuery}`,
+      ];
+      const forcePushHistory = yield* run(forcePushArgs).pipe(
+        Effect.flatMap((out) => decodeForcePushHistory(forcePushArgs, out)),
+      );
+      const forcePushes = forcePushHistory.data.repository?.pullRequest?.timelineItems.nodes
+        .filter((item): item is HeadRefForcePushedEvent => item !== null)
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      const latestForcePush = forcePushes?.at(-1);
+      if (latestForcePush) {
+        const before = latestForcePush.beforeCommit;
+        const after = latestForcePush.afterCommit;
+        if (!before || !after || after.parents.nodes.length !== 1) {
+          return yield* Effect.fail(new CodeHostReplayBaseNotFoundError(pr, "force-push history"));
+        }
+        return Option.some({
+          kind: "force-push-boundary" as const,
+          currentBase,
+          before: before.oid,
+          semanticHead: after.oid,
+          boundary: after.parents.nodes[0]!.oid,
+        });
+      }
+
       const query =
         "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(first:100,itemTypes:[BASE_REF_CHANGED_EVENT]){nodes{... on BaseRefChangedEvent{createdAt previousRefName currentRefName}}}}}}";
       const historyArgs = [
@@ -286,6 +359,7 @@ export const layer = Layer.effect(
       }
 
       return Option.some({
+        kind: "merged-parent" as const,
         branch: event.previousRefName,
         currentBase,
         head: parent.headRefOid,

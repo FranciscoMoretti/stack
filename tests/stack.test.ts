@@ -1622,6 +1622,13 @@ describe("GitHub", () => {
             calls.push([tool, ...args]);
             if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
             if (args[0] === "api") {
+              if (args.some((arg) => arg.includes("HEAD_REF_FORCE_PUSHED_EVENT"))) {
+                return JSON.stringify({
+                  data: {
+                    repository: { pullRequest: { timelineItems: { nodes: [] } } },
+                  },
+                });
+              }
               return JSON.stringify({
                 data: {
                   repository: {
@@ -1657,16 +1664,19 @@ describe("GitHub", () => {
       const replayBase = yield* github.replayBase(101, "main");
 
       expect(Option.getOrUndefined(replayBase)).toEqual({
+        kind: "merged-parent",
         branch: "landed-parent",
         currentBase: "main",
         head: "exact-parent-head",
         fetchRef: "refs/pull/100/head",
         change: 100,
       });
-      expect(calls).toHaveLength(3);
+      expect(calls).toHaveLength(4);
       expect(calls[0]).toEqual(["gh", "repo", "view", "--json", "nameWithOwner"]);
       expect(calls[1]).toContain("number=101");
-      expect(calls[2]).toEqual([
+      expect(calls[1]).toContainEqual(expect.stringContaining("HEAD_REF_FORCE_PUSHED_EVENT"));
+      expect(calls[2]).toContain("number=101");
+      expect(calls[3]).toEqual([
         "gh",
         "pr",
         "list",
@@ -1679,6 +1689,103 @@ describe("GitHub", () => {
         "--limit",
         "100",
       ]);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("recovers an exact replay boundary from durable force-push history", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
+            return JSON.stringify({
+              data: {
+                repository: {
+                  pullRequest: {
+                    timelineItems: {
+                      nodes: [
+                        {
+                          createdAt: "2026-08-03T12:48:55Z",
+                          beforeCommit: {
+                            oid: "a6600225",
+                            parents: { nodes: [{ oid: "35d69c1c" }] },
+                          },
+                          afterCommit: {
+                            oid: "67b27d90",
+                            parents: { nodes: [{ oid: "9c9bd6ed" }] },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            });
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const replayBase = yield* github.replayBase(3265, "main");
+
+      expect(Option.getOrUndefined(replayBase)).toEqual({
+        kind: "force-push-boundary",
+        currentBase: "main",
+        before: "a6600225",
+        semanticHead: "67b27d90",
+        boundary: "9c9bd6ed",
+      });
+      expect(calls).toHaveLength(2);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("fails closed when force-push history has an ambiguous boundary", () => {
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, _tool, args) =>
+          Effect.sync(() => {
+            if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
+            return JSON.stringify({
+              data: {
+                repository: {
+                  pullRequest: {
+                    timelineItems: {
+                      nodes: [
+                        {
+                          createdAt: "2026-08-03T12:48:55Z",
+                          beforeCommit: {
+                            oid: "before",
+                            parents: { nodes: [{ oid: "old-parent" }] },
+                          },
+                          afterCommit: {
+                            oid: "after",
+                            parents: { nodes: [{ oid: "parent-a" }, { oid: "parent-b" }] },
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            });
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const error = yield* Effect.flip(github.replayBase(3265, "main"));
+
+      expect(String(error)).toContain("force-push history");
     }).pipe(
       Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
     );
@@ -3498,6 +3605,7 @@ describe("Stack", () => {
                 [
                   101,
                   {
+                    kind: "merged-parent",
                     branch: "landed-parent",
                     currentBase: "main",
                     head: landedParentHead,
@@ -3553,6 +3661,225 @@ describe("Stack", () => {
         );
         expect(yield* shell(repo, "git", ["cat-file", "-t", landedParentHead])).toBe("commit");
         expect(log).not.toContain("body 103");
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
+  it.effect(
+    "sync uses the durable force-push boundary for the exact root cleanup suffix",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const repo = join(root, "fresh");
+        const log: Array<string> = [];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+
+        yield* commitFile(author, "base.txt", "base\n", "base");
+        const baseHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "persisted-anchor"]);
+        yield* shell(author, "git", ["commit", "--allow-empty", "-m", "persisted stack anchor"]);
+        const anchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["checkout", "main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root", baseHead]);
+        yield* commitFile(
+          author,
+          "dismissal-table.py",
+          "legacy inherited migration\n",
+          "Add global email thread dismissal storage",
+        );
+        const forbiddenInheritedCommit = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* commitFile(
+          author,
+          "model-registry.py",
+          "legacy inherited registry\n",
+          "Register global dismissal storage",
+        );
+        const inheritedBoundary = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* commitFile(
+          author,
+          "cleanup.txt",
+          "remove legacy routes\n",
+          "Remove legacy email dismissal routes",
+        );
+        const semanticHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+        yield* shell(author, "git", [
+          "merge",
+          "--no-ff",
+          "persisted-anchor",
+          "-m",
+          "Merge child anchor state",
+        ]);
+        const childAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* commitFile(
+          author,
+          "cleanup.txt",
+          "remove legacy routes\nnotify safely\n",
+          "Fix dismissal notifications and retry handling",
+        );
+        yield* commitFile(
+          author,
+          "cleanup.txt",
+          "remove legacy routes\nnotify safely\nkeep cleanup\n",
+          "Keep dismissal cleanup after notify lookup failures",
+        );
+        const originalRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "child"]);
+        yield* commitFile(
+          author,
+          "normalization.txt",
+          "retire\n",
+          "Retire dismissal normalization",
+        );
+        const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "naming.txt", "rename\n", "Inbound restore naming");
+        const originalGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+        yield* shell(author, "git", ["checkout", "-b", "great-grandchild"]);
+        yield* commitFile(author, "triage.txt", "global\n", "Global triage internals");
+        const originalGreatGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "great-grandchild"]);
+
+        yield* shell(author, "git", ["checkout", "main"]);
+        yield* commitFile(
+          author,
+          "dismissal-table.py",
+          "legacy inherited migration\n",
+          "land inherited dismissal storage",
+        );
+        yield* commitFile(
+          author,
+          "model-registry.py",
+          "legacy inherited registry\n",
+          "land inherited registry",
+        );
+        yield* shell(author, "git", ["push", "origin", "main"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo,
+              log,
+              pulls: [pr(3265, "root", "main"), pr(3267, "child", "root")],
+              metas: [
+                pullMeta({
+                  number: 3265,
+                  title: "legacy dismissal routes",
+                  body: "",
+                  head: "root",
+                  base: "main",
+                  url: "u3265",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+                pullMeta({
+                  number: 3267,
+                  title: "retire normalization",
+                  body: "",
+                  head: "child",
+                  base: "root",
+                  url: "u3267",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+              ],
+              replayBases: new Map([
+                [
+                  3265,
+                  {
+                    kind: "force-push-boundary",
+                    currentBase: "main",
+                    before: "unavailable-before-force-push",
+                    semanticHead,
+                    boundary: inheritedBoundary,
+                  },
+                ],
+              ]),
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({ branch: "root", parent: "main", anchor, pr: 3265 }),
+                  stackLink({ branch: "child", parent: "root", anchor: childAnchor, pr: 3267 }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.sync({ branch: "root" });
+          const applied = yield* stack.sync({ apply: true, branch: "root" });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+
+        const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+        const repairedRoot = yield* shell(repo, "git", ["rev-parse", "root"]);
+        const repairedSubjects = yield* shell(repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${mainHead}..${repairedRoot}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("root #3265 would rebase onto main");
+        expect(result.preview.join("\n")).toContain("child #3267 would rebase onto root");
+        expect(result.applied.join("\n")).not.toContain("grandchild");
+        expect(repairedSubjects.split("\n")).toEqual([
+          "Remove legacy email dismissal routes",
+          "Fix dismissal notifications and retry handling",
+          "Keep dismissal cleanup after notify lookup failures",
+        ]);
+        expect(repairedSubjects).not.toContain("Add global email thread dismissal storage");
+        expect(repairedSubjects).not.toContain(forbiddenInheritedCommit);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/root"])).toBe(repairedRoot);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).not.toBe(originalChild);
+        expect(yield* shell(repo, "git", ["ls-remote", "origin", "refs/heads/grandchild"])).toBe(
+          `${originalGrandchild}\trefs/heads/grandchild`,
+        );
+        expect(
+          yield* shell(repo, "git", ["ls-remote", "origin", "refs/heads/great-grandchild"]),
+        ).toBe(`${originalGreatGrandchild}\trefs/heads/great-grandchild`);
+        expect(originalRoot).not.toBe(repairedRoot);
+        expect(log).not.toContain("body 3272");
+        expect(log).not.toContain("body 3274");
       }).pipe(Effect.provide(platform)),
     20_000,
   );

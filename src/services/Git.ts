@@ -249,21 +249,22 @@ export const live = Layer.effect(
 
       const rangeDiff = yield* run("git", [
         "range-diff",
+        "--abbrev=40",
         "--no-color",
         "--no-patch",
         `${anchor}..${parent}`,
         `${anchor}..${branch}`,
       ]);
-      const matched = new Set<number>();
+      const matched = new Set<string>();
       for (const line of rangeDiff.split("\n")) {
-        const columns = line.match(/^\s*(\d+|-):\s+\S+\s+([<>=!])\s+(\d+|-):/);
+        const columns = line.match(/^\s*(\d+|-):\s+\S+\s+([<>=!])\s+(\d+|-):\s+(\S+)/);
         if (!columns || columns[1] === "-" || columns[3] === "-") continue;
         if (columns[2] !== "=" && columns[2] !== "!") continue;
-        matched.add(Number(columns[3]));
+        matched.add(columns[4]!);
       }
 
       let matchedParentPrefix = 0;
-      while (matched.has(matchedParentPrefix + 1)) matchedParentPrefix += 1;
+      while (matched.has(childCommits[matchedParentPrefix]!)) matchedParentPrefix += 1;
       return {
         commits: childCommits.slice(matchedParentPrefix),
         matchedParentPrefix,

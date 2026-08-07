@@ -893,15 +893,49 @@ ${note}`;
               if (!savedParent && trunk(parent) && link.pr) {
                 const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
                 if (Option.isSome(recovered)) {
-                  const fetchedHead = yield* git.fetchRef(recovered.value.fetchRef);
-                  if (fetchedHead !== recovered.value.head) {
-                    return yield* Effect.fail(
-                      new StackOperationError(
-                        `fetched ${recovered.value.fetchRef} at ${fetchedHead}, expected ${recovered.value.head}`,
-                      ),
-                    );
+                  if (recovered.value.kind === "force-push-boundary") {
+                    const { boundary, semanticHead } = recovered.value;
+                    const [
+                      boundaryHead,
+                      semanticHeadRef,
+                      embeddedAnchor,
+                      embeddedBoundary,
+                      embeddedSemanticHead,
+                    ] = yield* Effect.all([
+                      git.head(boundary),
+                      git.head(semanticHead),
+                      git.base(branch, anchor),
+                      git.base(semanticHead, boundary),
+                      git.base(branch, semanticHead),
+                    ]);
+                    if (
+                      Option.isNone(boundaryHead) ||
+                      Option.isNone(semanticHeadRef) ||
+                      Option.isNone(embeddedAnchor) ||
+                      embeddedAnchor.value !== anchor ||
+                      Option.isNone(embeddedBoundary) ||
+                      embeddedBoundary.value !== boundary ||
+                      Option.isNone(embeddedSemanticHead) ||
+                      embeddedSemanticHead.value !== semanticHead
+                    ) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `cannot verify force-push replay boundary ${boundary} -> ${semanticHead} for ${branch}`,
+                        ),
+                      );
+                    }
+                    return yield* git.novel(onto, branch, yield* git.commits(boundary, branch));
+                  } else {
+                    const fetchedHead = yield* git.fetchRef(recovered.value.fetchRef);
+                    if (fetchedHead !== recovered.value.head) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `fetched ${recovered.value.fetchRef} at ${fetchedHead}, expected ${recovered.value.head}`,
+                        ),
+                      );
+                    }
+                    candidates.push(recovered.value.head);
                   }
-                  candidates.push(recovered.value.head);
                 }
               }
               let selected = all;
