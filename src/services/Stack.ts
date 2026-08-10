@@ -883,7 +883,6 @@ ${note}`;
             ) {
               const branch = String(link.branch);
               const anchor = replayAnchors.get(branch) ?? String(link.anchor);
-              const all = yield* git.commits(anchor, branch);
               const savedParent = saved.get(String(link.parent));
               const candidates = savedParent
                 ? [savedParent]
@@ -895,24 +894,16 @@ ${note}`;
                 if (Option.isSome(recovered)) {
                   if (recovered.value.kind === "force-push-boundary") {
                     const { boundary, semanticHead } = recovered.value;
-                    const [
-                      boundaryHead,
-                      semanticHeadRef,
-                      embeddedAnchor,
-                      embeddedBoundary,
-                      embeddedSemanticHead,
-                    ] = yield* Effect.all([
-                      git.head(boundary),
-                      git.head(semanticHead),
-                      git.base(branch, anchor),
-                      git.base(semanticHead, boundary),
-                      git.base(branch, semanticHead),
-                    ]);
+                    const [boundaryHead, semanticHeadRef, embeddedBoundary, embeddedSemanticHead] =
+                      yield* Effect.all([
+                        git.head(boundary),
+                        git.head(semanticHead),
+                        git.base(semanticHead, boundary),
+                        git.base(branch, semanticHead),
+                      ]);
                     if (
                       Option.isNone(boundaryHead) ||
                       Option.isNone(semanticHeadRef) ||
-                      Option.isNone(embeddedAnchor) ||
-                      embeddedAnchor.value !== anchor ||
                       Option.isNone(embeddedBoundary) ||
                       embeddedBoundary.value !== boundary ||
                       Option.isNone(embeddedSemanticHead) ||
@@ -938,6 +929,7 @@ ${note}`;
                   }
                 }
               }
+              const all = yield* git.commits(anchor, branch);
               if (trunk(parent) && candidates.length === 0 && all.length > 1) {
                 return yield* Effect.fail(
                   new StackOperationError(

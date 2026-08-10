@@ -3765,9 +3765,13 @@ describe("Stack", () => {
         yield* shell(author, "git", ["push", "-u", "origin", "main"]);
         yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
 
+        yield* shell(author, "git", ["checkout", "-b", "stale-anchor"]);
+        yield* shell(author, "git", ["commit", "--allow-empty", "-m", "stale stack anchor"]);
+        const staleAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["checkout", "main"]);
+
         yield* shell(author, "git", ["checkout", "-b", "persisted-anchor"]);
         yield* shell(author, "git", ["commit", "--allow-empty", "-m", "persisted stack anchor"]);
-        const anchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
         yield* shell(author, "git", ["checkout", "main"]);
 
         yield* shell(author, "git", ["checkout", "-b", "root", baseHead]);
@@ -3911,7 +3915,7 @@ describe("Stack", () => {
               new StackState({
                 version: 1,
                 links: [
-                  stackLink({ branch: "root", parent: "main", anchor, pr: 3265 }),
+                  stackLink({ branch: "root", parent: "main", anchor: staleAnchor, pr: 3265 }),
                   stackLink({ branch: "child", parent: "root", anchor: childAnchor, pr: 3267 }),
                 ],
               }),
