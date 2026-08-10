@@ -3390,6 +3390,84 @@ describe("Stack", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
+  it.effect("sync fails closed for the 25-layer no-event root topology", () => {
+    const branches = [
+      "francisco/rest-compliance-10a1a-unused-inbox-reads",
+      ...Array.from({ length: 24 }, (_, index) => `francisco/rest-compliance-layer-${index + 2}`),
+    ];
+    const branchHeads = new Map(
+      branches.map((branch, index) => [branch, index === 0 ? "a8334210" : `head-${index + 1}`]),
+    );
+    const rootAnchor = "e0e3e3aa";
+    const refs = [
+      ref("dev", "319b394c"),
+      ...branches.map((branch) => ref(branch, branchHeads.get(branch)!)),
+    ];
+    const pulls = branches.map((branch, index) =>
+      pr(
+        3347 + index,
+        branch,
+        index === 0 ? "francisco/rest-compliance-09b8" : branches[index - 1]!,
+      ),
+    );
+    const links = branches.map((branch, index) =>
+      stackLink({
+        branch,
+        parent: index === 0 ? "dev" : branches[index - 1]!,
+        anchor: index === 0 ? rootAnchor : branchHeads.get(branches[index - 1]!)!,
+        pr: 3347 + index,
+      }),
+    );
+    const baseEntries: Array<readonly [string, string, string]> = [
+      [branches[0]!, "dev", rootAnchor],
+      ...branches
+        .slice(1)
+        .map(
+          (branch, index) =>
+            [branch, branches[index]!, branchHeads.get(branches[index]!)!] as const,
+        ),
+    ];
+    const inherited = Array.from({ length: 104 }, (_, index) => `inherited-${index + 1}`);
+    const commitRequests: Array<string> = [];
+    const mutations: Array<string> = [];
+    const layer = stackTestLayer({
+      current: branches.at(-1)!,
+      refs,
+      pulls,
+      bases: bases(...baseEntries),
+      state: stackState(links),
+      service: {
+        commits: (from, branch) =>
+          Effect.sync(() => {
+            commitRequests.push(`${from}..${branch}`);
+            return branch === branches[0] ? [...inherited, "9d375049", "a8334210"] : [];
+          }),
+        novel: (_parent, branch, commits) =>
+          Effect.sync(() => {
+            mutations.push(`novel ${branch}`);
+            return commits;
+          }),
+        replay: (branch) => Effect.sync(() => void mutations.push(`replay ${branch}`)),
+        backup: (branch) => Effect.sync(() => void mutations.push(`backup ${branch}`)),
+        push: (branch) => Effect.sync(() => void mutations.push(`push ${branch}`)),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const store = yield* Store;
+      const error = yield* Effect.flip(stack.sync({ branch: branches[0]! }));
+
+      expect(String(error)).toContain("semantic replay boundary required");
+      expect(String(error)).toContain("refusing to replay 106 commits");
+      expect(String(error)).toContain(rootAnchor);
+      expect(commitRequests).toContain(`${rootAnchor}..${branches[0]}`);
+      expect(mutations).toEqual([]);
+      expect((yield* store.read()).links).toHaveLength(25);
+      expect(yield* store.readUndo()).toBeNull();
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("sync filters already-upstream parent commits before replay", () => {
     const test = makeSyncNovel();
 

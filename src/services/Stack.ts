@@ -938,6 +938,13 @@ ${note}`;
                   }
                 }
               }
+              if (trunk(parent) && candidates.length === 0 && all.length > 1) {
+                return yield* Effect.fail(
+                  new StackOperationError(
+                    `semantic replay boundary required for ${branch}: no durable code-host lineage is available; refusing to replay ${all.length} commits from persisted anchor ${anchor}`,
+                  ),
+                );
+              }
               let selected = all;
               let matchedParentPrefix = 0;
 
