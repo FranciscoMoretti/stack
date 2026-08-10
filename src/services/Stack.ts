@@ -883,6 +883,19 @@ ${note}`;
             ) {
               const branch = String(link.branch);
               const anchor = replayAnchors.get(branch) ?? String(link.anchor);
+              const anchorHead = yield* git.head(anchor);
+              let persistedAnchorIsSharedBase = false;
+              if (Option.isSome(anchorHead)) {
+                const [anchorInBranch, anchorInTarget] = yield* Effect.all([
+                  git.base(branch, anchor),
+                  git.base(onto, anchor),
+                ]);
+                persistedAnchorIsSharedBase =
+                  Option.isSome(anchorInBranch) &&
+                  anchorInBranch.value === anchor &&
+                  Option.isSome(anchorInTarget) &&
+                  anchorInTarget.value === anchor;
+              }
               const savedParent = saved.get(String(link.parent));
               const candidates = savedParent
                 ? [savedParent]
@@ -893,6 +906,10 @@ ${note}`;
                 const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
                 if (Option.isSome(recovered)) {
                   if (recovered.value.kind === "force-push-boundary") {
+                    if (persistedAnchorIsSharedBase) {
+                      const all = yield* git.commits(anchor, branch);
+                      return yield* git.novel(onto, branch, all);
+                    }
                     const { boundary, semanticHead } = recovered.value;
                     const [boundaryHead, semanticHeadRef, embeddedBoundary, embeddedSemanticHead] =
                       yield* Effect.all([
@@ -930,7 +947,12 @@ ${note}`;
                 }
               }
               const all = yield* git.commits(anchor, branch);
-              if (trunk(parent) && candidates.length === 0 && all.length > 1) {
+              if (
+                trunk(parent) &&
+                candidates.length === 0 &&
+                all.length > 1 &&
+                !persistedAnchorIsSharedBase
+              ) {
                 return yield* Effect.fail(
                   new StackOperationError(
                     `semantic replay boundary required for ${branch}: no durable code-host lineage is available; refusing to replay ${all.length} commits from persisted anchor ${anchor}`,

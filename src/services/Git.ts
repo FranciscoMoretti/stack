@@ -224,7 +224,7 @@ export const live = Layer.effect(
       ),
     );
     const head = Effect.fn("Git.head")((name: string) =>
-      run("git", ["rev-parse", "--verify", name], [0, 1]).pipe(
+      run("git", ["rev-parse", "--verify", `${name}^{commit}`], [0, 1, 128]).pipe(
         Effect.map((out) => (out ? Option.some(out) : Option.none<string>())),
       ),
     );

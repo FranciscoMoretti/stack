@@ -3484,6 +3484,59 @@ describe("Stack", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
+  it.effect("sync prefers a persisted anchor shared by the root and trunk", () => {
+    const commitRequests: Array<string> = [];
+    const replayBaseRequests: Array<number> = [];
+    const layer = stackTestLayer({
+      current: "root",
+      refs: [ref("dev", "dev-new"), ref("root", "root-head")],
+      pulls: [pr(1, "root", "dev")],
+      state: stackState([stackLink({ branch: "root", parent: "dev", anchor: "dev-old", pr: 1 })]),
+      service: {
+        head: (name) => {
+          const heads: Readonly<Record<string, string>> = {
+            dev: "dev-new",
+            "origin/dev": "dev-new",
+            root: "root-head",
+            "dev-old": "dev-old",
+          };
+          return Effect.succeed(Option.fromNullishOr(heads[name]));
+        },
+        base: (branch, parent) => {
+          const sharedBase =
+            (branch === "root" && (parent === "origin/dev" || parent === "dev-old")) ||
+            (branch === "origin/dev" && parent === "dev-old");
+          return Effect.succeed(sharedBase ? Option.some("dev-old") : Option.none());
+        },
+        commits: (from, branch) =>
+          Effect.sync(() => {
+            commitRequests.push(`${from}..${branch}`);
+            return ["root-1", "root-2"];
+          }),
+        replayBase: (change) =>
+          Effect.sync(() => {
+            replayBaseRequests.push(change);
+            return Option.some<CodeHost.ReplayBase>({
+              kind: "force-push-boundary",
+              currentBase: "dev",
+              before: "old-root",
+              semanticHead: "root-1",
+              boundary: "inherited-boundary",
+            });
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const preview = yield* stack.sync({ branch: "root" });
+
+      expect(preview.join("\n")).toContain("root #1 would rebase onto dev");
+      expect(commitRequests).toEqual(["dev-old..root"]);
+      expect(replayBaseRequests).toEqual([1]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("sync uses stored child anchor after squash-merged parent is removed", () => {
     const seen: Array<string> = [];
     const pulls = [pr(2, "child", "dev")];
