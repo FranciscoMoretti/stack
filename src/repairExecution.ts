@@ -39,6 +39,9 @@ export const applyRebaseBranch = Effect.fn("RepairExecution.applyRebaseBranch")(
       new StackOperationError(`cannot resolve target head for ${plan.onto}`),
     );
   }
+  const expectedRemoteHeads = yield* Effect.all(
+    plan.pushRemotes.map((remote) => deps.git.remoteHead(remote, plan.branch)),
+  );
 
   yield* deps.checkpoint();
   yield* deps.step(`backup ${plan.branch} -> ${plan.backup}`);
@@ -67,11 +70,15 @@ export const applyRebaseBranch = Effect.fn("RepairExecution.applyRebaseBranch")(
     branch: plan.branch,
     parent: plan.parent,
   });
-  for (const remote of plan.pushRemotes) {
+  for (const [index, remote] of plan.pushRemotes.entries()) {
     yield* deps.step(
       StackResult.render({ _tag: "Push", mode: "apply", branch: plan.branch, remotes: [remote] }),
     );
-    yield* deps.git.push(plan.branch, remote);
+    yield* deps.git.push(
+      plan.branch,
+      remote,
+      Option.getOrNull(expectedRemoteHeads[index] ?? Option.none()),
+    );
     const remoteHead = yield* deps.git.remoteHead(remote, plan.branch);
     if (Option.isNone(remoteHead)) {
       return yield* Effect.fail(

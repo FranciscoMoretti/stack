@@ -1575,12 +1575,14 @@ describe("Git", () => {
     return Effect.gen(function* () {
       const git = yield* Git.Service;
       yield* git.push("stack-a");
-      yield* git.push("stack-b", "fork");
+      yield* git.push("stack-b", "fork", "expected-head");
+      yield* git.push("stack-c", "origin", null);
 
       expect(calls).toEqual([
         ["git", "push", "--force-with-lease", "-u", "origin", "stack-a"],
         ["git", "fetch", "fork", "--prune"],
-        ["git", "push", "--force-with-lease", "fork", "stack-b"],
+        ["git", "push", "--force-with-lease=refs/heads/stack-b:expected-head", "fork", "stack-b"],
+        ["git", "push", "--force-with-lease=refs/heads/stack-c:", "-u", "origin", "stack-c"],
       ]);
     }).pipe(Effect.provide(Git.live.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))));
   });

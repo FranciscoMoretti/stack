@@ -61,7 +61,11 @@ export interface Interface {
   readonly backup: (branch: string, name: string) => Effect.Effect<void, ExecError>;
   readonly drop: (branch: string) => Effect.Effect<void, ExecError>;
   readonly restore: (branch: string, name: string) => Effect.Effect<void, ExecError>;
-  readonly push: (branch: string, remote?: string) => Effect.Effect<void, ExecError>;
+  readonly push: (
+    branch: string,
+    remote?: string,
+    expectedHead?: string | null,
+  ) => Effect.Effect<void, ExecError>;
   readonly remoteHead: (
     remote: string,
     branch: string,
@@ -382,14 +386,22 @@ export const live = Layer.effect(
     const restore = Effect.fn("Git.restore")((branch: string, name: string) =>
       run("git", ["branch", "-f", branch, name]).pipe(Effect.asVoid),
     );
-    const push = Effect.fn("Git.push")((branch: string, remote = "origin") =>
-      remote === "origin"
-        ? run("git", ["push", "--force-with-lease", "-u", remote, branch]).pipe(Effect.asVoid)
+    const push = Effect.fn("Git.push")((
+      branch: string,
+      remote = "origin",
+      expectedHead?: string | null,
+    ) => {
+      const lease =
+        expectedHead === undefined
+          ? "--force-with-lease"
+          : `--force-with-lease=refs/heads/${branch}:${expectedHead ?? ""}`;
+      return remote === "origin"
+        ? run("git", ["push", lease, "-u", remote, branch]).pipe(Effect.asVoid)
         : run("git", ["fetch", remote, "--prune"]).pipe(
-            Effect.flatMap(() => run("git", ["push", "--force-with-lease", remote, branch])),
+            Effect.flatMap(() => run("git", ["push", lease, remote, branch])),
             Effect.asVoid,
-          ),
-    );
+          );
+    });
     const remoteHead = Effect.fn("Git.remoteHead")((remote: string, branch: string) =>
       run("git", ["ls-remote", "--heads", remote, `refs/heads/${branch}`]).pipe(
         Effect.map((out) => {
