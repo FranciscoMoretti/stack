@@ -22,6 +22,7 @@ export interface ReplayMergedParent {
   readonly branch: string;
   readonly currentBase: string;
   readonly head: string;
+  readonly historicalHeads: ReadonlyArray<string>;
   readonly fetchRef: string;
   readonly change: number;
 }

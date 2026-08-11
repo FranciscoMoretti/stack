@@ -358,11 +358,33 @@ export const layer = Layer.effect(
         return yield* Effect.fail(new CodeHostReplayBaseNotFoundError(pr, event.previousRefName));
       }
 
+      const parentForcePushArgs = [
+        "api",
+        "graphql",
+        "-F",
+        `owner=${owner}`,
+        "-F",
+        `name=${name}`,
+        "-F",
+        `number=${parent.number}`,
+        "-f",
+        `query=${forcePushQuery}`,
+      ];
+      const parentForcePushHistory = yield* run(parentForcePushArgs).pipe(
+        Effect.flatMap((out) => decodeForcePushHistory(parentForcePushArgs, out)),
+      );
+      const historicalHeads =
+        parentForcePushHistory.data.repository?.pullRequest?.timelineItems.nodes
+          .filter((item): item is HeadRefForcePushedEvent => item !== null)
+          .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+          .flatMap((item) => (item.beforeCommit ? [item.beforeCommit.oid] : [])) ?? [];
+
       return Option.some({
         kind: "merged-parent" as const,
         branch: event.previousRefName,
         currentBase,
         head: parent.headRefOid,
+        historicalHeads,
         fetchRef: `refs/pull/${parent.number}/head`,
         change: parent.number,
       });

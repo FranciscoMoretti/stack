@@ -1625,9 +1625,24 @@ describe("GitHub", () => {
             if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
             if (args[0] === "api") {
               if (args.some((arg) => arg.includes("HEAD_REF_FORCE_PUSHED_EVENT"))) {
+                const parentHistory = args.includes("number=100")
+                  ? [
+                      {
+                        createdAt: "2026-08-11T12:16:57Z",
+                        beforeCommit: {
+                          oid: "e70e19d723bd0d1435909397523fdc9f4ce3ae61",
+                          parents: { nodes: [{ oid: "dbe58fd5" }] },
+                        },
+                        afterCommit: {
+                          oid: "092cf7f0a979f4b1409de5723b735557476e25a2",
+                          parents: { nodes: [{ oid: "908bca65" }] },
+                        },
+                      },
+                    ]
+                  : [];
                 return JSON.stringify({
                   data: {
-                    repository: { pullRequest: { timelineItems: { nodes: [] } } },
+                    repository: { pullRequest: { timelineItems: { nodes: parentHistory } } },
                   },
                 });
               }
@@ -1670,10 +1685,11 @@ describe("GitHub", () => {
         branch: "landed-parent",
         currentBase: "main",
         head: "exact-parent-head",
+        historicalHeads: ["e70e19d723bd0d1435909397523fdc9f4ce3ae61"],
         fetchRef: "refs/pull/100/head",
         change: 100,
       });
-      expect(calls).toHaveLength(4);
+      expect(calls).toHaveLength(5);
       expect(calls[0]).toEqual(["gh", "repo", "view", "--json", "nameWithOwner"]);
       expect(calls[1]).toContain("number=101");
       expect(calls[1]).toContainEqual(expect.stringContaining("HEAD_REF_FORCE_PUSHED_EVENT"));
@@ -1691,6 +1707,8 @@ describe("GitHub", () => {
         "--limit",
         "100",
       ]);
+      expect(calls[4]).toContain("number=100");
+      expect(calls[4]).toContainEqual(expect.stringContaining("HEAD_REF_FORCE_PUSHED_EVENT"));
     }).pipe(
       Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
     );
@@ -3484,46 +3502,80 @@ describe("Stack", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
-  it.effect("sync prefers a persisted anchor shared by the root and trunk", () => {
-    const commitRequests: Array<string> = [];
-    const replayBaseRequests: Array<number> = [];
+  it.effect("sync recovers the exact promoted #3410 suffix from its parent's old head", () => {
+    const anchor = "e0e3e3aa04823085af12ca54188df0473b13eef9";
+    const forbidden = "856ea56814d5a8425044525370cef7fcba62b9ba";
+    const oldParent = "e70e19d723bd0d1435909397523fdc9f4ce3ae61";
+    const repairedParent = "092cf7f0a979f4b1409de5723b735557476e25a2";
+    const root = "e3999ebfab5709ae903a7166a1b95085e1be6baf";
+    const child = "3f75a349091bcf1db9bee5f0f8f87da21ef8a477";
+    const selected: Array<ReadonlyArray<string>> = [];
     const layer = stackTestLayer({
       current: "root",
-      refs: [ref("dev", "dev-new"), ref("root", "root-head")],
-      pulls: [pr(1, "root", "dev")],
-      state: stackState([stackLink({ branch: "root", parent: "dev", anchor: "dev-old", pr: 1 })]),
+      refs: [
+        ref("dev", "11fd7a7486099790131eb614a1ff731258e1cbd7"),
+        ref("root", root),
+        ref("child", child),
+      ],
+      pulls: [pr(3410, "root", "dev"), pr(3411, "child", "root")],
+      state: stackState([
+        stackLink({ branch: "root", parent: "dev", anchor, pr: 3410 }),
+        stackLink({ branch: "child", parent: "root", anchor: root, pr: 3411 }),
+      ]),
       service: {
         head: (name) => {
           const heads: Readonly<Record<string, string>> = {
-            dev: "dev-new",
-            "origin/dev": "dev-new",
-            root: "root-head",
-            "dev-old": "dev-old",
+            dev: "11fd7a7486099790131eb614a1ff731258e1cbd7",
+            "origin/dev": "11fd7a7486099790131eb614a1ff731258e1cbd7",
+            root,
+            child,
+            [anchor]: anchor,
+            [oldParent]: oldParent,
+            [repairedParent]: repairedParent,
           };
           return Effect.succeed(Option.fromNullishOr(heads[name]));
         },
         base: (branch, parent) => {
-          const sharedBase =
-            (branch === "root" && (parent === "origin/dev" || parent === "dev-old")) ||
-            (branch === "origin/dev" && parent === "dev-old");
-          return Effect.succeed(sharedBase ? Option.some("dev-old") : Option.none());
+          const value: Readonly<Record<string, string>> = {
+            [`root:origin/dev`]: anchor,
+            [`root:${anchor}`]: anchor,
+            [`origin/dev:${anchor}`]: anchor,
+            [`${repairedParent}:${anchor}`]: anchor,
+            [`root:${repairedParent}`]: anchor,
+            [`${oldParent}:${anchor}`]: anchor,
+            [`root:${oldParent}`]: oldParent,
+            "child:root": root,
+          };
+          return Effect.succeed(Option.fromNullishOr(value[`${branch}:${parent}`]));
         },
         commits: (from, branch) =>
+          Effect.succeed(
+            from === oldParent && branch === "root"
+              ? [root]
+              : from === anchor && branch === "root"
+                ? [forbidden, oldParent, root]
+                : [],
+          ),
+        semanticCommits: () =>
+          Effect.succeed({ commits: [forbidden, oldParent, root], matchedParentPrefix: 0 }),
+        novel: (_parent, branch, commits) =>
           Effect.sync(() => {
-            commitRequests.push(`${from}..${branch}`);
-            return ["root-1", "root-2"];
+            if (branch === "root") selected.push(commits);
+            return commits;
           }),
-        replayBase: (change) =>
-          Effect.sync(() => {
-            replayBaseRequests.push(change);
-            return Option.some<CodeHost.ReplayBase>({
-              kind: "force-push-boundary",
+        fetchRef: () => Effect.succeed(repairedParent),
+        replayBase: () =>
+          Effect.succeed(
+            Option.some<CodeHost.ReplayBase>({
+              kind: "merged-parent",
+              branch: "francisco/rest-compliance-10c5-canonical-reply-integrations",
               currentBase: "dev",
-              before: "old-root",
-              semanticHead: "root-1",
-              boundary: "inherited-boundary",
-            });
-          }),
+              head: repairedParent,
+              historicalHeads: [oldParent],
+              fetchRef: "refs/pull/3409/head",
+              change: 3409,
+            }),
+          ),
       },
     });
 
@@ -3531,9 +3583,10 @@ describe("Stack", () => {
       const stack = yield* Stack;
       const preview = yield* stack.sync({ branch: "root" });
 
-      expect(preview.join("\n")).toContain("root #1 would rebase onto dev");
-      expect(commitRequests).toEqual(["dev-old..root"]);
-      expect(replayBaseRequests).toEqual([1]);
+      expect(preview.join("\n")).toContain("root #3410 would rebase onto dev");
+      expect(preview.join("\n")).toContain("child #3411 would rebase onto root");
+      expect(selected).toContainEqual([root]);
+      expect(selected.flat()).not.toContain(forbidden);
     }).pipe(Effect.provide(layer));
   });
 
@@ -3742,6 +3795,7 @@ describe("Stack", () => {
                     branch: "landed-parent",
                     currentBase: "main",
                     head: landedParentHead,
+                    historicalHeads: [],
                     fetchRef: "refs/pull/100/head",
                     change: 100,
                   },
