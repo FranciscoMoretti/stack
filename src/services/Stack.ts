@@ -889,32 +889,37 @@ ${note}`;
                 : trunk(parent)
                   ? Array.from(landedBackups)
                   : [];
+              const verifyForcePushBoundary = Effect.fn(
+                "Stack.repairStack.verifyForcePushBoundary",
+              )(function* (boundary: string, semanticHead: string) {
+                const [boundaryHead, semanticHeadRef, embeddedBoundary, embeddedSemanticHead] =
+                  yield* Effect.all([
+                    git.head(boundary),
+                    git.head(semanticHead),
+                    git.base(semanticHead, boundary),
+                    git.base(branch, semanticHead),
+                  ]);
+                if (
+                  Option.isNone(boundaryHead) ||
+                  Option.isNone(semanticHeadRef) ||
+                  Option.isNone(embeddedBoundary) ||
+                  embeddedBoundary.value !== boundary ||
+                  Option.isNone(embeddedSemanticHead) ||
+                  embeddedSemanticHead.value !== semanticHead
+                ) {
+                  return yield* Effect.fail(
+                    new StackOperationError(
+                      `cannot verify force-push replay boundary ${boundary} -> ${semanticHead} for ${branch}`,
+                    ),
+                  );
+                }
+              });
               if (!savedParent && trunk(parent) && link.pr) {
                 const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
                 if (Option.isSome(recovered)) {
                   if (recovered.value.kind === "force-push-boundary") {
                     const { boundary, semanticHead } = recovered.value;
-                    const [boundaryHead, semanticHeadRef, embeddedBoundary, embeddedSemanticHead] =
-                      yield* Effect.all([
-                        git.head(boundary),
-                        git.head(semanticHead),
-                        git.base(semanticHead, boundary),
-                        git.base(branch, semanticHead),
-                      ]);
-                    if (
-                      Option.isNone(boundaryHead) ||
-                      Option.isNone(semanticHeadRef) ||
-                      Option.isNone(embeddedBoundary) ||
-                      embeddedBoundary.value !== boundary ||
-                      Option.isNone(embeddedSemanticHead) ||
-                      embeddedSemanticHead.value !== semanticHead
-                    ) {
-                      return yield* Effect.fail(
-                        new StackOperationError(
-                          `cannot verify force-push replay boundary ${boundary} -> ${semanticHead} for ${branch}`,
-                        ),
-                      );
-                    }
+                    yield* verifyForcePushBoundary(boundary, semanticHead);
                     return yield* git.novel(onto, branch, yield* git.commits(boundary, branch));
                   } else {
                     const fetchedHead = yield* git.fetchRef(recovered.value.fetchRef);
@@ -972,6 +977,39 @@ ${note}`;
                 if (semantic.matchedParentPrefix <= matchedParentPrefix) continue;
                 selected = semantic.commits;
                 matchedParentPrefix = semantic.matchedParentPrefix;
+              }
+
+              if (
+                savedParent &&
+                trunk(parent) &&
+                link.pr &&
+                all.length > 1 &&
+                matchedParentPrefix === 0 &&
+                !savedParentBoundaryVerified
+              ) {
+                const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
+                if (Option.isSome(recovered) && recovered.value.kind === "force-push-boundary") {
+                  const { boundary, semanticHead } = recovered.value;
+                  yield* verifyForcePushBoundary(boundary, semanticHead);
+                  const [firstParent, secondParent, thirdParent, embeddedAnchor, sharedAnchor] =
+                    yield* Effect.all([
+                      git.head(`${branch}^1`),
+                      git.head(`${branch}^2`),
+                      git.head(`${branch}^3`),
+                      git.base(savedParent, anchor),
+                      git.base(branch, savedParent),
+                    ]);
+                  savedParentBoundaryVerified =
+                    Option.isSome(firstParent) &&
+                    firstParent.value === semanticHead &&
+                    Option.isSome(secondParent) &&
+                    secondParent.value === anchor &&
+                    Option.isNone(thirdParent) &&
+                    Option.isSome(embeddedAnchor) &&
+                    embeddedAnchor.value === anchor &&
+                    Option.isSome(sharedAnchor) &&
+                    sharedAnchor.value === anchor;
+                }
               }
 
               if (

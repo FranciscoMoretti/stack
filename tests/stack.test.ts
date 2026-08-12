@@ -5047,6 +5047,198 @@ describe("Stack", () => {
     20_000,
   );
 
+  it.effect(
+    "land trusts a child anchor embedded in the child's preservation merge",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const repo = join(root, "fresh");
+        const log: Array<string> = [];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+
+        yield* commitFile(author, "base.txt", "base\n", "base");
+        const base = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root"]);
+        yield* commitFile(author, "root-anchor.txt", "anchor\n", "request drafting foundation");
+        const anchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* commitFile(author, "root.txt", "root\n", "defer request agents at capacity");
+        const originalRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "child", base]);
+        const childSubjects = [
+          "verify mention-to-draft integration",
+          "verify raw mention gating",
+          "format mention seam tests",
+          "keep legacy root replay coverage",
+          "exercise production mention dispatch",
+          "keep integration capability-neutral",
+        ];
+        for (const [index, subject] of childSubjects.entries()) {
+          yield* commitFile(author, `child-${index}.txt`, `${subject}\n`, subject);
+        }
+        const semanticHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        const forcePushBoundary = yield* shell(author, "git", ["rev-parse", "HEAD^"]);
+        yield* shell(author, "git", [
+          "merge",
+          "--no-ff",
+          anchor,
+          "-m",
+          "preserve reviewed root history",
+        ]);
+        const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "deeper.txt", "deeper\n", "deeper semantic layer");
+        const originalGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", [
+          "fetch",
+          "origin",
+          "root:root",
+          "child:child",
+          "grandchild:grandchild",
+        ]);
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo,
+              log,
+              pulls: [
+                pr(3760, "root", "main"),
+                pr(3761, "child", "root"),
+                pr(3762, "grandchild", "child"),
+              ],
+              metas: [
+                pullMeta({
+                  number: 3760,
+                  title: "trigger drafting agents",
+                  body: "",
+                  head: "root",
+                  base: "main",
+                  url: "u3760",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+                pullMeta({
+                  number: 3761,
+                  title: "mention-to-draft",
+                  body: "",
+                  head: "child",
+                  base: "root",
+                  url: "u3761",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+                pullMeta({
+                  number: 3762,
+                  title: "deeper",
+                  body: "",
+                  head: "grandchild",
+                  base: "child",
+                  url: "u3762",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+              ],
+              replayBases: new Map([
+                [
+                  3761,
+                  {
+                    kind: "force-push-boundary",
+                    currentBase: "main",
+                    before: "previous-child-head",
+                    semanticHead,
+                    boundary: forcePushBoundary,
+                  },
+                ],
+              ]),
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({ branch: "root", parent: "main", anchor: base, pr: 3760 }),
+                  stackLink({ branch: "child", parent: "root", anchor, pr: 3761 }),
+                  stackLink({
+                    branch: "grandchild",
+                    parent: "child",
+                    anchor: originalChild,
+                    pr: 3762,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.land("root", { repairDepth: 1 });
+          const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+
+        const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+        const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+        const repairedSubjects = yield* shell(repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${mainHead}..${childHead}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("would merge #3760 (root)");
+        expect(result.preview.join("\n")).toContain("would rebase child onto main");
+        expect(result.preview.join("\n")).not.toContain("grandchild");
+        expect(result.applied.join("\n")).toContain("next root: child");
+        expect(result.applied.join("\n")).not.toContain("grandchild");
+        expect(repairedSubjects.split("\n")).toEqual(childSubjects);
+        expect(repairedSubjects).not.toContain("request drafting foundation");
+        expect(repairedSubjects).not.toContain("defer request agents at capacity");
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+        expect(yield* shell(repo, "git", ["rev-parse", "grandchild"])).toBe(originalGrandchild);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/grandchild"])).toBe(
+          originalGrandchild,
+        );
+        expect(originalRoot).not.toBe(mainHead);
+        expect(log).not.toContain("body 3762");
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
   it.effect("land supports a root-only repair depth", () => {
     const planTest = makeLand();
     const doneTest = makeLand();
