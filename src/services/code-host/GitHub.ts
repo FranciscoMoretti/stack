@@ -293,20 +293,23 @@ export const layer = Layer.effect(
         .filter((item): item is HeadRefForcePushedEvent => item !== null)
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
       const latestForcePush = forcePushes?.at(-1);
-      if (latestForcePush) {
+      const forcePushReplay = () => {
+        if (!latestForcePush) return Effect.succeed(Option.none<CodeHost.ReplayBase>());
         const before = latestForcePush.beforeCommit;
         const after = latestForcePush.afterCommit;
         if (!before || !after || after.parents.nodes.length !== 1) {
-          return yield* Effect.fail(new CodeHostReplayBaseNotFoundError(pr, "force-push history"));
+          return Effect.fail(new CodeHostReplayBaseNotFoundError(pr, "force-push history"));
         }
-        return Option.some({
-          kind: "force-push-boundary" as const,
-          currentBase,
-          before: before.oid,
-          semanticHead: after.oid,
-          boundary: after.parents.nodes[0]!.oid,
-        });
-      }
+        return Effect.succeed(
+          Option.some({
+            kind: "force-push-boundary" as const,
+            currentBase,
+            before: before.oid,
+            semanticHead: after.oid,
+            boundary: after.parents.nodes[0]!.oid,
+          }),
+        );
+      };
 
       const query =
         "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(first:100,itemTypes:[BASE_REF_CHANGED_EVENT]){nodes{... on BaseRefChangedEvent{createdAt previousRefName currentRefName}}}}}}";
@@ -329,6 +332,9 @@ export const layer = Layer.effect(
         .filter((item): item is BaseRefChangedEvent => item?.currentRefName === currentBase)
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
         .at(-1);
+      if (latestForcePush && !event) {
+        return yield* forcePushReplay();
+      }
       if (!event) return Option.none<CodeHost.ReplayBase>();
 
       const mergedArgs = [

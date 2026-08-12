@@ -66,6 +66,21 @@ export interface StackService {
   readonly undo: (apply?: boolean) => Effect.Effect<ReadonlyArray<string>, StackError>;
 }
 
+interface AuditedReplayPlan {
+  readonly branch: string;
+  readonly branchHead: string;
+  readonly sourceParent: string;
+  readonly savedParentHead: string | null;
+  readonly anchor: string;
+  readonly parent: string;
+  readonly onto: string;
+  readonly commits: ReadonlyArray<string>;
+  readonly remoteHeads: ReadonlyArray<{
+    readonly remote: string;
+    readonly head: string | null;
+  }>;
+}
+
 export class Stack extends Context.Service<Stack, StackService>()("@stack/Stack") {
   static readonly layer = Layer.effect(
     Stack,
@@ -774,6 +789,8 @@ ${note}`;
             ) => Effect.Effect<void, StackError>;
             readonly preserveUndo?: boolean;
             readonly preserveTrunkRoots?: boolean;
+            readonly captureReplayPlans?: boolean;
+            readonly auditedReplays?: ReadonlyMap<string, AuditedReplayPlan>;
           },
         ) =>
           Effect.gen(function* () {
@@ -821,6 +838,7 @@ ${note}`;
             const moved = new Set<string>();
             const entries: Array<UndoEntry> = Array.from(opts.initialEntries ?? []);
             const next: Array<StackLink> = [];
+            const replayPlans = new Map<string, AuditedReplayPlan>();
             let journal = apply && (initialActions.length > 0 || entries.length > 0);
 
             const headRemote = Effect.fn("Stack.repairStack.headRemote")(function* (
@@ -884,6 +902,39 @@ ${note}`;
               const branch = String(link.branch);
               const anchor = replayAnchors.get(branch) ?? String(link.anchor);
               const savedParent = saved.get(String(link.parent));
+              const audited = opts.auditedReplays?.get(branch);
+              if (audited) {
+                const currentRange = yield* git.commits(anchor, branch);
+                const branchHead = Option.getOrNull(yield* git.head(branch));
+                const savedParentHead = savedParent
+                  ? Option.getOrNull(yield* git.head(savedParent))
+                  : null;
+                const currentRangeCommits = new Set(currentRange);
+                const mismatches = [
+                  branchHead !== audited.branchHead ? "branch head" : null,
+                  String(link.parent) !== audited.sourceParent ? "source parent" : null,
+                  audited.savedParentHead !== null && savedParentHead !== audited.savedParentHead
+                    ? "saved parent head"
+                    : null,
+                  anchor !== audited.anchor ? "anchor" : null,
+                  parent !== audited.parent ? "resolved parent" : null,
+                  onto !== audited.onto ? "target ref" : null,
+                  audited.commits.some((commit) => !currentRangeCommits.has(commit))
+                    ? "semantic range"
+                    : null,
+                ].filter((item): item is string => item !== null);
+                if (mismatches.length > 0) {
+                  return yield* Effect.fail(
+                    new StackOperationError(
+                      `audited replay plan diverged for ${branch} (${mismatches.join(", ")}); refusing to replay before cherry-pick`,
+                    ),
+                  );
+                }
+                return Array.from(audited.commits);
+              }
+              const savedParentHead = savedParent
+                ? Option.getOrNull(yield* git.head(savedParent))
+                : null;
               const candidates = savedParent
                 ? [savedParent]
                 : trunk(parent)
@@ -943,16 +994,21 @@ ${note}`;
               if (savedParent) {
                 const persistedParent = links.get(String(link.parent));
                 if (persistedParent?.pr) {
-                  const savedParentHead = yield* git.head(savedParent);
                   const recoveredParent = yield* codeHost.replayBase(
                     Number(persistedParent.pr),
                     String(persistedParent.parent),
                   );
+                  const recoveredSemanticHead =
+                    Option.isSome(recoveredParent) &&
+                    recoveredParent.value.kind === "force-push-boundary" &&
+                    savedParentHead !== null
+                      ? yield* git.base(savedParent, recoveredParent.value.semanticHead)
+                      : Option.none<string>();
                   if (
                     Option.isSome(recoveredParent) &&
                     recoveredParent.value.kind === "force-push-boundary" &&
-                    Option.isSome(savedParentHead) &&
-                    recoveredParent.value.semanticHead === savedParentHead.value
+                    Option.isSome(recoveredSemanticHead) &&
+                    recoveredSemanticHead.value === recoveredParent.value.semanticHead
                   ) {
                     const { before, boundary, semanticHead } = recoveredParent.value;
                     const [semanticHeadRef, firstParent, secondParent] = yield* Effect.all([
@@ -978,18 +1034,13 @@ ${note}`;
               }
 
               for (const candidate of candidates) {
-                const [candidateHead, embeddedAnchor, embeddedCandidate] = yield* Effect.all([
-                  git.head(candidate),
+                const candidateHead = yield* git.head(candidate);
+                if (Option.isNone(candidateHead) || candidateHead.value === anchor) continue;
+                const [embeddedAnchor, embeddedCandidate] = yield* Effect.all([
                   git.base(candidate, anchor),
                   git.base(branch, candidate),
                 ]);
-                if (
-                  Option.isNone(candidateHead) ||
-                  candidateHead.value === anchor ||
-                  Option.isNone(embeddedAnchor) ||
-                  embeddedAnchor.value !== anchor
-                )
-                  continue;
+                if (Option.isNone(embeddedAnchor) || embeddedAnchor.value !== anchor) continue;
                 const preservedMergeParents =
                   candidate === savedParent ? yield* git.mergeParents(candidate) : [];
                 if (
@@ -1132,7 +1183,26 @@ ${note}`;
               },
             );
 
-            if (apply) yield* ensureRepairableWorktrees([...(yield* plannedRepairBranches())]);
+            if (apply) {
+              const repairBranches = yield* plannedRepairBranches();
+              if (opts.auditedReplays) {
+                const auditedBranches = new Set(opts.auditedReplays.keys());
+                const unexpected = [...repairBranches].filter(
+                  (branch) => !auditedBranches.has(branch),
+                );
+                const missing = [...auditedBranches].filter(
+                  (branch) => !repairBranches.has(branch),
+                );
+                if (unexpected.length > 0 || missing.length > 0) {
+                  return yield* Effect.fail(
+                    new StackOperationError(
+                      `audited replay scope diverged before apply (unexpected: ${unexpected.join(", ") || "none"}; missing: ${missing.join(", ") || "none"})`,
+                    ),
+                  );
+                }
+              }
+              yield* ensureRepairableWorktrees([...repairBranches]);
+            }
 
             for (const link of [...state.links].sort(
               (a, b) => graph.rank(String(a.branch)) - graph.rank(String(b.branch)),
@@ -1201,7 +1271,71 @@ ${note}`;
                   headRepository,
                   pr ? Number(pr.number) : link.pr ? Number(link.pr) : null,
                 );
+                const audited = opts.auditedReplays?.get(String(link.branch));
+                const actualRemoteHeads = audited
+                  ? yield* Effect.all(
+                      targetRemotes.map((remote) =>
+                        git
+                          .remoteHead(remote, String(link.branch))
+                          .pipe(Effect.map((head) => ({ remote, head: Option.getOrNull(head) }))),
+                      ),
+                    )
+                  : [];
+                if (
+                  audited &&
+                  (targetRemotes.length !== audited.remoteHeads.length ||
+                    actualRemoteHeads.some(
+                      (actual, index) =>
+                        actual.remote !== audited.remoteHeads[index]?.remote ||
+                        actual.head !== audited.remoteHeads[index]?.head,
+                    ))
+                ) {
+                  return yield* Effect.fail(
+                    new StackOperationError(
+                      `audited remote head diverged for ${link.branch}; refusing to replay before cherry-pick`,
+                    ),
+                  );
+                }
                 const commitsToReplay = yield* commitsForReplay(link, parent, onto);
+                if (opts.captureReplayPlans) {
+                  const branchHead = yield* git.head(String(link.branch));
+                  if (Option.isNone(branchHead)) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `cannot capture audited replay head for ${link.branch}`,
+                      ),
+                    );
+                  }
+                  const savedParentRef = saved.get(String(link.parent));
+                  const savedParentHead = savedParentRef
+                    ? yield* git.head(savedParentRef)
+                    : Option.none<string>();
+                  if (savedParentRef && Option.isNone(savedParentHead)) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `cannot capture audited saved parent head for ${link.branch}`,
+                      ),
+                    );
+                  }
+                  const remoteHeads = yield* Effect.all(
+                    targetRemotes.map((remote) =>
+                      git
+                        .remoteHead(remote, String(link.branch))
+                        .pipe(Effect.map((head) => ({ remote, head: Option.getOrNull(head) }))),
+                    ),
+                  );
+                  replayPlans.set(String(link.branch), {
+                    branch: String(link.branch),
+                    branchHead: branchHead.value,
+                    sourceParent: String(link.parent),
+                    savedParentHead: Option.getOrNull(savedParentHead),
+                    anchor: replayAnchors.get(String(link.branch)) ?? String(link.anchor),
+                    parent,
+                    onto,
+                    commits: Array.from(commitsToReplay),
+                    remoteHeads,
+                  });
+                }
                 backup = `backup/stack-sync-${stamp}-${link.branch}`;
                 const rebase = {
                   branch: String(link.branch),
@@ -1393,6 +1527,7 @@ ${note}`;
             return {
               actions,
               state: resultState,
+              replayPlans,
               undo: journal
                 ? undoState(
                     stamp,
@@ -2028,7 +2163,11 @@ ${note}`;
               scopedState,
               refs.filter((item) => item.name !== target),
               repairPulls,
-              { apply: false, saved: new Map([[target, target]]) },
+              {
+                apply: false,
+                saved: new Map([[target, target]]),
+                captureReplayPlans: true,
+              },
             );
             if (active) {
               yield* ensureRepairableWorktrees([
@@ -2070,6 +2209,7 @@ ${note}`;
                   {
                     apply: true,
                     saved: new Map([[target, name]]),
+                    auditedReplays: plannedRepair.replayPlans,
                     journalState: nextState,
                     journalActions: retargetActions,
                     writeState: writeScopedState(branches),
