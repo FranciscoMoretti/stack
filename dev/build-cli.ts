@@ -1,5 +1,11 @@
 import { chmod } from "node:fs/promises";
 
+const buildRuntime = "1.3.1";
+if (Bun.version !== buildRuntime) {
+  console.error(`stack bundles require Bun ${buildRuntime}; found ${Bun.version}`);
+  process.exit(1);
+}
+
 const result = await Bun.build({
   entrypoints: ["src/cli.ts"],
   format: "esm",
