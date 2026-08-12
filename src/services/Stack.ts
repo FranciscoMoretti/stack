@@ -1770,9 +1770,9 @@ ${note}`;
                 new StackOperationError(`--admin is not supported by ${codeHost.provider}`),
               );
             }
-            if (repairDepth !== undefined && (!Number.isInteger(repairDepth) || repairDepth < 1)) {
+            if (repairDepth !== undefined && (!Number.isInteger(repairDepth) || repairDepth < 0)) {
               return yield* Effect.fail(
-                new StackOperationError("--repair-depth must be a positive integer"),
+                new StackOperationError("--repair-depth must be a non-negative integer"),
               );
             }
             const active = apply || auto;

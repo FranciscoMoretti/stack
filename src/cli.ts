@@ -49,7 +49,7 @@ const through = Flag.string("through").pipe(
 
 const repairDepth = Flag.integer("repair-depth").pipe(
   Flag.withDescription(
-    "Limit root-merge repair to this many descendant layers. The immediate child is depth 1.",
+    "Limit root-merge repair to this many descendant layers. Use 0 for the root only; the immediate child is depth 1.",
   ),
   Flag.optional,
 );
@@ -208,7 +208,7 @@ const mergeCommand = Command.make(
   }),
 ).pipe(
   Command.withDescription(
-    "Merge the oldest branch in a stack, preserve a local backup branch, repair descendants, and print the next root branch. If branch is omitted, infer the root from the current branch. By default this is a dry run. Add --repair-depth <n> to bound repair to n descendant layers. Add --apply to merge immediately, --apply --admin to force with admin privileges (GitHub only), or --auto to enable code-host auto-merge and wait until it lands before repairing descendants. Add --auto --through <branch-or-change> for a bounded range.",
+    "Merge the oldest branch in a stack, preserve a local backup branch, repair descendants, and print the next root branch. If branch is omitted, infer the root from the current branch. By default this is a dry run. Add --repair-depth <n> to bound repair to n descendant layers; use 0 to merge only the root. Add --apply to merge immediately, --apply --admin to force with admin privileges (GitHub only), or --auto to enable code-host auto-merge and wait until it lands before repairing descendants. Add --auto --through <branch-or-change> for a bounded range.",
   ),
   Command.withExamples([
     {
@@ -226,6 +226,10 @@ const mergeCommand = Command.make(
     {
       command: "stack merge effectify-watcher --repair-depth 2",
       description: "Preview the root plus at most two descendant repair layers",
+    },
+    {
+      command: "stack merge effectify-watcher --repair-depth 0",
+      description: "Preview a root-only merge without descendant repair",
     },
     {
       command: "stack merge effectify-watcher --auto",

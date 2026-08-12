@@ -4884,15 +4884,43 @@ describe("Stack", () => {
     15_000,
   );
 
-  it.effect("land rejects a non-positive repair depth", () => {
+  it.effect("land supports a root-only repair depth", () => {
+    const planTest = makeLand();
+    const doneTest = makeLand();
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const plan = yield* stack.land("stack-a", { repairDepth: 0 });
+
+      expect(plan).toContain("would merge #4 (stack-a)");
+      expect(plan.join("\n")).not.toContain("stack-b");
+    })
+      .pipe(Effect.provide(planTest.layer))
+      .pipe(
+        Effect.flatMap(() =>
+          Effect.gen(function* () {
+            const stack = yield* Stack;
+            const done = yield* stack.land("stack-a", { apply: true, repairDepth: 0 });
+
+            expect(done).toContain("merge #4 (stack-a)");
+            expect(done.join("\n")).not.toContain("stack-b");
+            expect(doneTest.seen).toContain("merge 4");
+            expect(doneTest.seen).not.toContain("edit 5 dev");
+            expect(doneTest.seen.some((item) => item.startsWith("rebase stack-b"))).toBe(false);
+          }).pipe(Effect.provide(doneTest.layer)),
+        ),
+      );
+  });
+
+  it.effect("land rejects a negative repair depth", () => {
     const test = makeLand();
 
     return Effect.gen(function* () {
       const stack = yield* Stack;
-      const error = yield* Effect.flip(stack.land("stack-a", { repairDepth: 0 }));
+      const error = yield* Effect.flip(stack.land("stack-a", { repairDepth: -1 }));
 
       expect(error).toBeInstanceOf(StackOperationError);
-      expect(error.message).toContain("--repair-depth must be a positive integer");
+      expect(error.message).toContain("--repair-depth must be a non-negative integer");
       expect(test.seen).toEqual([]);
     }).pipe(Effect.provide(test.layer));
   });
