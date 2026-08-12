@@ -933,6 +933,7 @@ ${note}`;
               const all = yield* git.commits(anchor, branch);
               let selected = all;
               let matchedParentPrefix = 0;
+              let savedParentBoundaryVerified = false;
 
               for (const candidate of candidates) {
                 const [candidateHead, embeddedAnchor, embeddedCandidate] = yield* Effect.all([
@@ -947,6 +948,17 @@ ${note}`;
                   embeddedAnchor.value !== anchor
                 )
                   continue;
+                const preservedMergeParents =
+                  candidate === savedParent ? yield* git.mergeParents(candidate) : [];
+                if (
+                  candidate === savedParent &&
+                  Option.isSome(embeddedCandidate) &&
+                  embeddedCandidate.value === anchor &&
+                  preservedMergeParents.includes(anchor)
+                ) {
+                  savedParentBoundaryVerified = true;
+                  break;
+                }
                 let semantic;
                 if (Option.isSome(embeddedCandidate) && embeddedCandidate.value === candidate) {
                   const commits = yield* git.commits(candidate, branch);
@@ -962,7 +974,12 @@ ${note}`;
                 matchedParentPrefix = semantic.matchedParentPrefix;
               }
 
-              if (trunk(parent) && all.length > 1 && matchedParentPrefix === 0) {
+              if (
+                trunk(parent) &&
+                all.length > 1 &&
+                matchedParentPrefix === 0 &&
+                !savedParentBoundaryVerified
+              ) {
                 return yield* Effect.fail(
                   new StackOperationError(
                     `semantic replay boundary required for ${branch}: durable code-host lineage did not match the persisted range; refusing to replay ${all.length} commits from persisted anchor ${anchor}`,

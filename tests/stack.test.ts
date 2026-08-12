@@ -90,6 +90,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     head: () => Effect.succeed(Option.none()),
     base: () => Effect.succeed(Option.none()),
     commits: () => Effect.succeed([]),
+    mergeParents: () => Effect.succeed([]),
     semanticCommits: () => Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
     novel: (_parent, _branch, commits) => Effect.succeed(commits),
     replay: () => Effect.void,
@@ -4882,6 +4883,168 @@ describe("Stack", () => {
         expect(log).not.toContain("body 3");
       }).pipe(Effect.provide(platform)),
     15_000,
+  );
+
+  it.effect(
+    "land trusts a child anchor embedded in the rewritten root history",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const repo = join(root, "repo");
+        const log: Array<string> = [];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(repo);
+        yield* shell(repo, "git", ["init", "-b", "dev"]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", ["remote", "add", "origin", origin]);
+
+        yield* commitFile(repo, "base.txt", "base\n", "base");
+        yield* shell(repo, "git", ["push", "-u", "origin", "dev"]);
+        const rootAnchor = yield* shell(repo, "git", ["rev-parse", "dev"]);
+
+        yield* shell(repo, "git", ["checkout", "-b", "root"]);
+        yield* commitFile(repo, "root.txt", "old root\n", "old root semantic layer");
+        const oldRoot = yield* shell(repo, "git", ["rev-parse", "root"]);
+
+        yield* shell(repo, "git", ["checkout", "-b", "child"]);
+        yield* commitFile(repo, "schema.ts", "schema\n", "own email thread schemas");
+        yield* commitFile(
+          repo,
+          "description.ts",
+          "legacy description\n",
+          "preserve legacy schema description",
+        );
+        const originalChild = yield* shell(repo, "git", ["rev-parse", "child"]);
+        yield* shell(repo, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(repo, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(repo, "grandchild.ts", "grandchild\n", "deeper semantic layer");
+        const originalGrandchild = yield* shell(repo, "git", ["rev-parse", "grandchild"]);
+        yield* shell(repo, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(repo, "git", ["checkout", "dev"]);
+        yield* commitFile(repo, "trunk.txt", "advanced\n", "advance trunk");
+        yield* shell(repo, "git", ["push", "origin", "dev"]);
+        yield* shell(repo, "git", ["checkout", "-b", "repaired-root"]);
+        yield* commitFile(repo, "repaired.txt", "repaired\n", "repair root on current trunk");
+        yield* shell(repo, "git", ["merge", "--no-ff", "root", "-m", "preserve old root history"]);
+        const rewrittenRoot = yield* shell(repo, "git", ["rev-parse", "HEAD"]);
+        yield* shell(repo, "git", ["branch", "-f", "root", rewrittenRoot]);
+        yield* shell(repo, "git", ["push", "-u", "origin", "root", "--force"]);
+        yield* shell(repo, "git", ["checkout", "dev"]);
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["dev"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo,
+              log,
+              pulls: [
+                pr(3411, "root", "dev"),
+                pr(3422, "child", "root"),
+                pr(3423, "grandchild", "child"),
+              ],
+              metas: [
+                pullMeta({
+                  number: 3411,
+                  title: "reply composer",
+                  body: "",
+                  head: "root",
+                  base: "dev",
+                  url: "u3411",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+                pullMeta({
+                  number: 3422,
+                  title: "own email thread schemas",
+                  body: "",
+                  head: "child",
+                  base: "root",
+                  url: "u3422",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+                pullMeta({
+                  number: 3423,
+                  title: "deeper layer",
+                  body: "",
+                  head: "grandchild",
+                  base: "child",
+                  url: "u3423",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+              ],
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({ branch: "root", parent: "dev", anchor: rootAnchor, pr: 3411 }),
+                  stackLink({ branch: "child", parent: "root", anchor: oldRoot, pr: 3422 }),
+                  stackLink({
+                    branch: "grandchild",
+                    parent: "child",
+                    anchor: originalChild,
+                    pr: 3423,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.land("root", { repairDepth: 1 });
+          const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+
+        const devHead = yield* shell(repo, "git", ["rev-parse", "dev"]);
+        const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+        const subjects = yield* shell(repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${devHead}..${childHead}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("would merge #3411 (root)");
+        expect(result.preview.join("\n")).toContain("would rebase child onto dev");
+        expect(result.preview.join("\n")).not.toContain("grandchild");
+        expect(result.applied.join("\n")).toContain("next root: child");
+        expect(result.applied.join("\n")).not.toContain("grandchild");
+        expect(subjects.split("\n")).toEqual([
+          "own email thread schemas",
+          "preserve legacy schema description",
+        ]);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+        expect(yield* shell(repo, "git", ["rev-parse", "grandchild"])).toBe(originalGrandchild);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/grandchild"])).toBe(
+          originalGrandchild,
+        );
+        expect(log).not.toContain("body 3423");
+      }).pipe(Effect.provide(platform)),
+    20_000,
   );
 
   it.effect("land supports a root-only repair depth", () => {
