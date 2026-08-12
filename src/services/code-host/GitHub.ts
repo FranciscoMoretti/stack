@@ -332,7 +332,7 @@ export const layer = Layer.effect(
         .filter((item): item is BaseRefChangedEvent => item?.currentRefName === currentBase)
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
         .at(-1);
-      if (latestForcePush && !event) {
+      if (latestForcePush && (!event || latestForcePush.createdAt > event.createdAt)) {
         return yield* forcePushReplay();
       }
       if (!event) return Option.none<CodeHost.ReplayBase>();

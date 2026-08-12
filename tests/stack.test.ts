@@ -475,6 +475,122 @@ const realStack = (opts: {
     };
   });
 
+const promotedTriggerFixture = (root: string, rootMerged: boolean) =>
+  Effect.gen(function* () {
+    const origin = join(root, "origin.git");
+    const author = join(root, "author");
+    const repo = join(root, "fresh");
+    const scheduleSubjects = Array.from(
+      { length: 10 },
+      (_, index) => `inherited Schedule layer ${index + 1}`,
+    );
+    const triggerSubjects = Array.from(
+      { length: 8 },
+      (_, index) => `inherited Trigger layer ${index + 1}`,
+    );
+    const parentSubjects = [
+      "ALA-2842: return 201 for Schedule creation",
+      "ALA-2842: type the Schedule status test",
+      "REST Compliance 19A.6: Update Schedule OpenAPI snapshot",
+    ];
+    const childSubjects = [
+      "ALA-2843: return 201 for Trigger creation",
+      "ALA-2843: type the Trigger status test",
+      "REST Compliance 19A.7: Update Trigger OpenAPI snapshot",
+    ];
+
+    yield* shell(root, "git", ["init", "--bare", origin]);
+    yield* mkdirp(author);
+    yield* shell(author, "git", ["init", "-b", "main"]);
+    yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(author, "git", ["remote", "add", "origin", origin]);
+
+    yield* commitFile(author, "base.txt", "base\n", "persisted child anchor");
+    const persistedChildAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+    yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "historical-parent"]);
+    for (const [index, subject] of [...scheduleSubjects, ...triggerSubjects].entries()) {
+      yield* commitFile(author, `inherited-${index}.txt`, `${subject}\n`, subject);
+    }
+    const parentCommits: Array<string> = [];
+    for (const [index, subject] of parentSubjects.entries()) {
+      yield* commitFile(author, `parent-${index}.txt`, `${subject}\n`, subject);
+      parentCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+    }
+    const historicalParent = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "child"]);
+    for (const [index, subject] of childSubjects.entries()) {
+      yield* commitFile(author, `child-${index}.txt`, `${subject}\n`, subject);
+    }
+    const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "descendant"]);
+    yield* commitFile(author, "descendant.txt", "deeper\n", "deeper untouched layer");
+    const originalDescendant = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "descendant"]);
+
+    yield* shell(author, "git", ["checkout", "main"]);
+    yield* shell(author, "git", ["merge", "--squash", `${historicalParent}~3`]);
+    yield* shell(author, "git", ["commit", "-m", "merge inherited stacks"]);
+    const rootAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["checkout", "-b", "root"]);
+    for (const commit of parentCommits) {
+      yield* shell(author, "git", ["cherry-pick", commit]);
+    }
+    yield* commitFile(author, "root-only.txt", "root fix\n", "root-only landing fix");
+    const currentRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    const currentRootBoundary = yield* shell(author, "git", ["rev-parse", "HEAD^"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+    if (rootMerged) {
+      yield* shell(author, "git", ["checkout", "main"]);
+      yield* shell(author, "git", ["merge", "--squash", "root"]);
+      yield* shell(author, "git", ["commit", "-m", "merge root"]);
+      yield* shell(author, "git", ["push", "origin", "main"]);
+      yield* shell(root, "git", [
+        "--git-dir",
+        origin,
+        "update-ref",
+        "refs/pull/3564/head",
+        currentRoot,
+      ]);
+      yield* shell(author, "git", ["push", "origin", "--delete", "root"]);
+    } else {
+      yield* shell(author, "git", ["checkout", "main"]);
+      yield* shell(author, "git", ["push", "origin", "main"]);
+    }
+
+    yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+    yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(repo, "git", [
+      "fetch",
+      "origin",
+      ...(rootMerged ? ["child:child"] : ["root:root", "child:child"]),
+    ]);
+
+    return {
+      repo,
+      persistedChildAnchor,
+      rootAnchor,
+      historicalParent,
+      currentRoot,
+      currentRootBoundary,
+      originalChild,
+      originalDescendant,
+      scheduleSubjects,
+      triggerSubjects,
+      parentSubjects,
+      childSubjects,
+      mainHead: yield* shell(repo, "git", ["rev-parse", "main"]),
+    };
+  });
+
 const cfg = StackConfig.layer({ root: "/tmp/stack", trunks: ["dev"] }).pipe(
   Layer.provide(NodeServices.layer),
 );
@@ -1803,6 +1919,75 @@ describe("GitHub", () => {
         historicalHeads: [],
         fetchRef: "refs/pull/3563/head",
         change: 3563,
+      });
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("prefers a later parent force push over an earlier base change", () => {
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, _tool, args) =>
+          Effect.sync(() => {
+            if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
+            if (args[0] === "api" && args.some((arg) => arg.includes("number=3564"))) {
+              if (args.some((arg) => arg.includes("HEAD_REF_FORCE_PUSHED_EVENT"))) {
+                return JSON.stringify({
+                  data: {
+                    repository: {
+                      pullRequest: {
+                        timelineItems: {
+                          nodes: [
+                            {
+                              createdAt: "2026-08-12T16:57:47Z",
+                              beforeCommit: { oid: "b991ec406", parents: { nodes: [] } },
+                              afterCommit: {
+                                oid: "0c58eaf4",
+                                parents: { nodes: [{ oid: "f859a171" }] },
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                });
+              }
+              return JSON.stringify({
+                data: {
+                  repository: {
+                    pullRequest: {
+                      timelineItems: {
+                        nodes: [
+                          {
+                            createdAt: "2026-08-12T15:34:33Z",
+                            previousRefName: "root",
+                            currentRefName: "main",
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              });
+            }
+            return JSON.stringify([]);
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const replayBase = yield* github.replayBase(3564, "main");
+
+      expect(Option.getOrUndefined(replayBase)).toEqual({
+        kind: "force-push-boundary",
+        currentBase: "main",
+        before: "b991ec406",
+        semanticHead: "0c58eaf4",
+        boundary: "f859a171",
       });
     }).pipe(
       Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
@@ -5597,6 +5782,213 @@ describe("Stack", () => {
         expect(recoveryLog).not.toContain("body 3565");
       }).pipe(Effect.provide(platform)),
     45_000,
+  );
+
+  it.effect(
+    "land keeps the audited trigger-creation suffix across the parent merge transition",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const fixture = yield* promotedTriggerFixture(root, false);
+        const log: Array<string> = [];
+        const cfgLayer = StackConfig.layer({ root: fixture.repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo: fixture.repo,
+              log,
+              pulls: [
+                pr(3564, "root", "main"),
+                pr(3565, "child", "root"),
+                pr(3566, "descendant", "child"),
+              ],
+              metas: [
+                metaFor(pr(3564, "root", "main")),
+                metaFor(pr(3565, "child", "root")),
+                metaFor(pr(3566, "descendant", "child")),
+              ],
+              replayBases: new Map([
+                [
+                  3564,
+                  {
+                    kind: "force-push-boundary",
+                    currentBase: "main",
+                    before: fixture.historicalParent,
+                    semanticHead: fixture.currentRoot,
+                    boundary: fixture.currentRootBoundary,
+                  },
+                ],
+              ]),
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({
+                    branch: "root",
+                    parent: "main",
+                    anchor: fixture.rootAnchor,
+                    pr: 3564,
+                  }),
+                  stackLink({
+                    branch: "child",
+                    parent: "root",
+                    anchor: fixture.persistedChildAnchor,
+                    pr: 3565,
+                  }),
+                  stackLink({
+                    branch: "descendant",
+                    parent: "child",
+                    anchor: fixture.originalChild,
+                    pr: 3566,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.land("root", { repairDepth: 1 });
+          const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+        const mainHead = yield* shell(fixture.repo, "git", ["rev-parse", "main"]);
+        const childHead = yield* shell(fixture.repo, "git", ["rev-parse", "child"]);
+        const subjects = yield* shell(fixture.repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${mainHead}..${childHead}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("would merge #3564 (root)");
+        expect(result.preview.join("\n")).toContain("would rebase child onto main");
+        expect(result.preview.join("\n")).not.toContain("descendant");
+        expect(result.applied.join("\n")).toContain("next root: child");
+        expect(result.applied.join("\n")).not.toContain("descendant");
+        expect(subjects.split("\n")).toEqual(fixture.childSubjects);
+        for (const inherited of [
+          ...fixture.scheduleSubjects,
+          ...fixture.triggerSubjects,
+          ...fixture.parentSubjects,
+          "root-only landing fix",
+        ]) {
+          expect(subjects).not.toContain(inherited);
+        }
+        expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+        expect(yield* shell(fixture.repo, "git", ["branch", "--list", "descendant"])).toBe("");
+        expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/descendant"])).toBe(
+          fixture.originalDescendant,
+        );
+        expect(log).not.toContain("body 3566");
+      }).pipe(Effect.provide(platform)),
+    25_000,
+  );
+
+  it.effect(
+    "recovers only the trigger-creation suffix after the parent was squash merged",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const fixture = yield* promotedTriggerFixture(root, true);
+        const log: Array<string> = [];
+        const cfgLayer = StackConfig.layer({ root: fixture.repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo: fixture.repo,
+              log,
+              pulls: [pr(3565, "child", "main"), pr(3566, "descendant", "child")],
+              metas: [metaFor(pr(3565, "child", "main")), metaFor(pr(3566, "descendant", "child"))],
+              replayBases: new Map([
+                [
+                  3565,
+                  {
+                    kind: "merged-parent",
+                    branch: "root",
+                    currentBase: "main",
+                    head: fixture.currentRoot,
+                    historicalHeads: [fixture.historicalParent],
+                    fetchRef: "refs/pull/3564/head",
+                    change: 3564,
+                  },
+                ],
+              ]),
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({
+                    branch: "child",
+                    parent: "main",
+                    anchor: fixture.persistedChildAnchor,
+                    pr: 3565,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.sync({ branch: "child" });
+          const applied = yield* stack.sync({ branch: "child", apply: true });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+        const childHead = yield* shell(fixture.repo, "git", ["rev-parse", "child"]);
+        const subjects = yield* shell(fixture.repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${fixture.mainHead}..${childHead}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("child");
+        expect(result.preview.join("\n")).not.toContain("descendant");
+        expect(result.applied.join("\n")).not.toContain("descendant");
+        expect(subjects.split("\n")).toEqual(fixture.childSubjects);
+        for (const inherited of [
+          ...fixture.scheduleSubjects,
+          ...fixture.triggerSubjects,
+          ...fixture.parentSubjects,
+          "root-only landing fix",
+        ]) {
+          expect(subjects).not.toContain(inherited);
+        }
+        expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+        expect(yield* shell(fixture.repo, "git", ["branch", "--list", "descendant"])).toBe("");
+        expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/descendant"])).toBe(
+          fixture.originalDescendant,
+        );
+        expect(log).not.toContain("body 3566");
+      }).pipe(Effect.provide(platform)),
+    25_000,
   );
 
   it.effect(
