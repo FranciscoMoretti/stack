@@ -1854,6 +1854,231 @@ describe("GitHub", () => {
     );
   });
 
+  it.effect("uses GitHub's asynchronous API for a native stacked PR", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            const endpoint = args.find((arg) => arg.startsWith("repos/"));
+            if (endpoint === "repos/{owner}/{repo}/pulls/7") {
+              return JSON.stringify({
+                head: { sha: "expected-head" },
+                stack: { number: 12 },
+              });
+            }
+            if (endpoint === "repos/{owner}/{repo}/stacks/12") {
+              return JSON.stringify({
+                pull_requests: [
+                  { number: 5, state: "closed", merged_at: "2026-01-01T00:00:00Z" },
+                  { number: 7, state: "open", merged_at: null },
+                  { number: 8, state: "open", merged_at: null },
+                ],
+              });
+            }
+            if (args.includes("--method")) {
+              return JSON.stringify({ status: "pending", details: { uuid: "request-id" } });
+            }
+            if (endpoint === "repos/{owner}/{repo}/pulls/7/merge-async/request-id") {
+              return JSON.stringify({ status: "merged", details: { sha: "merge-head" } });
+            }
+            throw new Error(`Unexpected command: ${args.join(" ")}`);
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      yield* github.merge(7);
+
+      expect(calls).toEqual([
+        ["gh", "api", "repos/{owner}/{repo}/pulls/7"],
+        ["gh", "api", "repos/{owner}/{repo}/stacks/12"],
+        [
+          "gh",
+          "api",
+          "--method",
+          "PUT",
+          "repos/{owner}/{repo}/pulls/7/merge-async",
+          "-f",
+          "merge_method=squash",
+          "-f",
+          "merge_action=direct_merge",
+          "-f",
+          "sha=expected-head",
+        ],
+        ["gh", "api", "repos/{owner}/{repo}/pulls/7/merge-async/request-id"],
+      ]);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("accepts GitHub's idempotent pending response after a repeated submission", () => {
+    const submitOkCodes: Array<ReadonlyArray<number> | undefined> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args, ok) => {
+          const endpoint = args.find((arg) => arg.startsWith("repos/"));
+          if (endpoint === "repos/{owner}/{repo}/pulls/7") {
+            return Effect.succeed(
+              JSON.stringify({ head: { sha: "expected-head" }, stack: { number: 12 } }),
+            );
+          }
+          if (endpoint === "repos/{owner}/{repo}/stacks/12") {
+            return Effect.succeed(
+              JSON.stringify({
+                pull_requests: [{ number: 7, state: "open", merged_at: null }],
+              }),
+            );
+          }
+          if (args.includes("--method")) {
+            submitOkCodes.push(ok);
+            return ok?.includes(1)
+              ? Effect.succeed(
+                  JSON.stringify({ status: "pending", details: { uuid: "existing-request" } }),
+                )
+              : Effect.fail(new ExecError(tool, args, 1, "Conflict (HTTP 409)"));
+          }
+          return Effect.succeed(
+            JSON.stringify({ status: "merged", details: { sha: "merge-head" } }),
+          );
+        },
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      yield* github.merge(7);
+
+      expect(submitOkCodes).toEqual([[0, 1]]);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("fails before a native stack merge would include another open PR", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            const endpoint = args.find((arg) => arg.startsWith("repos/"));
+            if (endpoint === "repos/{owner}/{repo}/pulls/7") {
+              return JSON.stringify({ head: { sha: "expected-head" }, stack: { number: 12 } });
+            }
+            if (endpoint === "repos/{owner}/{repo}/stacks/12") {
+              return JSON.stringify({
+                pull_requests: [
+                  { number: 5, state: "open", merged_at: null },
+                  { number: 7, state: "open", merged_at: null },
+                ],
+              });
+            }
+            throw new Error(`Unexpected command: ${args.join(" ")}`);
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const error = yield* Effect.flip(github.merge(7));
+
+      expect(error._tag).toBe("ExecError");
+      if (error._tag !== "ExecError") return;
+      expect(error.stderr).toContain("would also merge open PR #5");
+      expect(calls).toHaveLength(2);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("keeps the legacy merge path for a non-stacked PR", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            return args[0] === "api"
+              ? JSON.stringify({ head: { sha: "expected-head" }, stack: null })
+              : "";
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      yield* github.merge(7, { admin: true });
+
+      expect(calls).toEqual([
+        ["gh", "api", "repos/{owner}/{repo}/pulls/7"],
+        ["gh", "pr", "merge", "7", "--squash", "--admin"],
+      ]);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("rejects admin bypass for a native stacked PR", () => {
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, _tool, _args) =>
+          Effect.succeed(JSON.stringify({ head: { sha: "expected-head" }, stack: { number: 12 } })),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const error = yield* Effect.flip(github.merge(7, { admin: true }));
+
+      expect(error._tag).toBe("UnsupportedCodeHostOperation");
+      expect(error.message).toContain("native stacked PR admin merge");
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("submits a native stacked PR for default merge handling in auto mode", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            const endpoint = args.find((arg) => arg.startsWith("repos/"));
+            if (endpoint === "repos/{owner}/{repo}/pulls/7") {
+              return JSON.stringify({ head: { sha: "expected-head" }, stack: { number: 12 } });
+            }
+            if (endpoint === "repos/{owner}/{repo}/stacks/12") {
+              return JSON.stringify({
+                pull_requests: [{ number: 7, state: "open", merged_at: null }],
+              });
+            }
+            return JSON.stringify({ status: "enqueued", details: {} });
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      yield* github.auto(7);
+
+      expect(calls.at(-1)).toContain("merge_action=default");
+      expect(calls.some((call) => call[1] === "pr" && call[2] === "merge")).toBe(false);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
   it.effect("normalizes repository identity for fork push routing", () => {
     const proc = Layer.succeed(
       Proc.Service,

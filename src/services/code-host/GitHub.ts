@@ -12,6 +12,7 @@ import {
   PullMeta,
   pullRef,
   PullRef,
+  UnsupportedCodeHostOperation,
 } from "../../domain/model.ts";
 import * as Proc from "../../platform/proc.ts";
 import { StackConfig } from "../Config.ts";
@@ -37,6 +38,40 @@ class PullView extends Schema.Class<PullView>("PullView")({
 class PullWatch extends Schema.Class<PullWatch>("PullWatch")({
   state: Schema.String,
   mergedAt: Schema.NullOr(Schema.String),
+}) {}
+
+class PullMergeView extends Schema.Class<PullMergeView>("PullMergeView")({
+  head: Schema.Struct({ sha: Schema.String }),
+  stack: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        number: Schema.Number,
+      }),
+    ),
+  ),
+}) {}
+
+class NativeStackView extends Schema.Class<NativeStackView>("NativeStackView")({
+  pull_requests: Schema.Array(
+    Schema.Struct({
+      number: Schema.Number,
+      state: Schema.String,
+      merged_at: Schema.NullOr(Schema.String),
+    }),
+  ),
+}) {}
+
+class AsyncMergeView extends Schema.Class<AsyncMergeView>("AsyncMergeView")({
+  status: Schema.String,
+  details: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        uuid: Schema.optional(Schema.String),
+        message: Schema.optional(Schema.String),
+        sha: Schema.optional(Schema.String),
+      }),
+    ),
+  ),
 }) {}
 
 class RepositoryView extends Schema.Class<RepositoryView>("RepositoryView")({
@@ -144,6 +179,24 @@ const decodePullView = (args: ReadonlyArray<string>, out: string) =>
 const decodePullWatch = (args: ReadonlyArray<string>, out: string) =>
   Effect.try({
     try: () => Schema.decodeUnknownSync(PullWatch)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodePullMergeView = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(PullMergeView)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodeNativeStackView = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(NativeStackView)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodeAsyncMergeView = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(AsyncMergeView)(JSON.parse(extractJson(out))),
     catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
   });
 
@@ -390,16 +443,106 @@ export const layer = Layer.effect(
       });
     });
 
-    const auto = Effect.fn("CodeHost.github.auto")((pr: number) =>
-      run(["pr", "merge", `${pr}`, "--auto", "--squash"]).pipe(Effect.asVoid),
-    );
+    const nativeStackMerge = Effect.fn("CodeHost.github.nativeStackMerge")(function* (
+      pr: number,
+      mergeAction: "default" | "direct_merge",
+      admin: boolean,
+    ) {
+      const pullArgs = ["api", `repos/{owner}/{repo}/pulls/${pr}`];
+      const pull = yield* run(pullArgs).pipe(
+        Effect.flatMap((out) => decodePullMergeView(pullArgs, out)),
+      );
+      if (!pull.stack) return false;
+      if (admin) {
+        return yield* Effect.fail(
+          new UnsupportedCodeHostOperation("github", "native stacked PR admin merge"),
+        );
+      }
 
-    const merge = Effect.fn("CodeHost.github.merge")(
-      (pr: number, opts?: { readonly admin?: boolean }) =>
-        run(["pr", "merge", `${pr}`, "--squash", ...(opts?.admin ? ["--admin"] : [])]).pipe(
-          Effect.asVoid,
+      const stackArgs = ["api", `repos/{owner}/{repo}/stacks/${pull.stack.number}`];
+      const stack = yield* run(stackArgs).pipe(
+        Effect.flatMap((out) => decodeNativeStackView(stackArgs, out)),
+      );
+      const targetIndex = stack.pull_requests.findIndex((item) => item.number === pr);
+      if (targetIndex === -1) {
+        return yield* Effect.fail(
+          new ExecError("gh", stackArgs, 1, `PR #${pr} is missing from native stack`),
+        );
+      }
+      const openLowerPull = stack.pull_requests
+        .slice(0, targetIndex)
+        .find((item) => item.state.toLowerCase() === "open" && item.merged_at === null);
+      if (openLowerPull) {
+        return yield* Effect.fail(
+          new ExecError(
+            "gh",
+            stackArgs,
+            1,
+            `Native stack merge of PR #${pr} would also merge open PR #${openLowerPull.number}`,
+          ),
+        );
+      }
+
+      const submitArgs = [
+        "api",
+        "--method",
+        "PUT",
+        `repos/{owner}/{repo}/pulls/${pr}/merge-async`,
+        "-f",
+        "merge_method=squash",
+        "-f",
+        `merge_action=${mergeAction}`,
+        "-f",
+        `sha=${pull.head.sha}`,
+      ];
+      const submittedOut = yield* run(submitArgs, [0, 1]);
+      let result = yield* decodeAsyncMergeView(submitArgs, submittedOut);
+
+      while (result.status === "pending") {
+        const requestId = result.details?.uuid;
+        if (!requestId) {
+          return yield* Effect.fail(
+            new CodeHostDecodeError(
+              "gh",
+              submitArgs,
+              submittedOut,
+              "pending asynchronous merge response is missing details.uuid",
+            ),
+          );
+        }
+        const pollArgs = ["api", `repos/{owner}/{repo}/pulls/${pr}/merge-async/${requestId}`];
+        const pollOut = yield* run(pollArgs);
+        result = yield* decodeAsyncMergeView(pollArgs, pollOut);
+        if (result.status === "pending") {
+          yield* Effect.sleep(cfg.codeHostWaitIntervalMillis);
+        }
+      }
+
+      if (result.status === "merged") return true;
+      if (mergeAction === "default" && result.status === "enqueued") return true;
+      return yield* Effect.fail(
+        new ExecError(
+          "gh",
+          submitArgs,
+          1,
+          result.details?.message ?? `asynchronous merge ended with status ${result.status}`,
         ),
-    );
+      );
+    });
+
+    const auto = Effect.fn("CodeHost.github.auto")(function* (pr: number) {
+      if (yield* nativeStackMerge(pr, "default", false)) return;
+      yield* run(["pr", "merge", `${pr}`, "--auto", "--squash"]);
+    });
+
+    const merge = Effect.fn("CodeHost.github.merge")(function* (
+      pr: number,
+      opts?: { readonly admin?: boolean },
+    ) {
+      const admin = opts?.admin ?? false;
+      if (yield* nativeStackMerge(pr, "direct_merge", admin)) return;
+      yield* run(["pr", "merge", `${pr}`, "--squash", ...(admin ? ["--admin"] : [])]);
+    });
 
     const wait = Effect.fn("CodeHost.github.wait")((pr: number) =>
       Effect.gen(function* () {

@@ -62,6 +62,10 @@ stack merge --apply
 Use `stack merge --auto` when the code host should wait for merge requirements,
 then repair descendants automatically after the root lands.
 
+GitHub-native stacked PRs use GitHub's asynchronous stack merge API. Kit fails
+closed when that API would merge another open PR below the selected root;
+GitHub does not support admin bypass or persistent auto-merge for native stacks.
+
 ## What It Does
 
 `stack sync --apply` is the common maintenance workflow:
