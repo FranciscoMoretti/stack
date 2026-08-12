@@ -4886,6 +4886,183 @@ describe("Stack", () => {
   );
 
   it.effect(
+    "land trusts an append-only root fork from the persisted child anchor",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const repo = join(root, "fresh");
+        const log: Array<string> = [];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+
+        yield* commitFile(author, "base.txt", "base\n", "base");
+        const base = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root"]);
+        yield* commitFile(
+          author,
+          "assignment.txt",
+          "consolidated\n",
+          "consolidate task assignment",
+        );
+        const childAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "child"]);
+        const childSubjects = ["add canonical task state PATCH", "update task OpenAPI snapshot"];
+        yield* commitFile(author, "task-patch.txt", "canonical\n", childSubjects[0]!);
+        yield* commitFile(author, "openapi.txt", "snapshot\n", childSubjects[1]!);
+        const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "consumer.txt", "consumer\n", "migrate task state consumers");
+        const originalGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(author, "git", ["checkout", "root"]);
+        yield* commitFile(
+          author,
+          "assignment-fix.txt",
+          "atomic claim\n",
+          "rely on atomic run claim for assignment",
+        );
+        const originalRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        expect(yield* shell(author, "git", ["rev-parse", "HEAD^"])).toBe(childAnchor);
+        yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", [
+          "fetch",
+          "origin",
+          "root:root",
+          "child:child",
+          "grandchild:grandchild",
+        ]);
+        expect(yield* shell(repo, "git", ["merge-base", "root", "child"])).toBe(childAnchor);
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo,
+              log,
+              pulls: [
+                pr(3517, "root", "main"),
+                pr(3518, "child", "root"),
+                pr(3519, "grandchild", "child"),
+              ],
+              metas: [
+                pullMeta({
+                  number: 3517,
+                  title: "task assignment cutover",
+                  body: "",
+                  head: "root",
+                  base: "main",
+                  url: "u3517",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+                pullMeta({
+                  number: 3518,
+                  title: "canonical task patch",
+                  body: "",
+                  head: "child",
+                  base: "root",
+                  url: "u3518",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+                pullMeta({
+                  number: 3519,
+                  title: "task state consumers",
+                  body: "",
+                  head: "grandchild",
+                  base: "child",
+                  url: "u3519",
+                  draft: false,
+                  state: "OPEN",
+                  labels: [],
+                }),
+              ],
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({ branch: "root", parent: "main", anchor: base, pr: 3517 }),
+                  stackLink({ branch: "child", parent: "root", anchor: childAnchor, pr: 3518 }),
+                  stackLink({
+                    branch: "grandchild",
+                    parent: "child",
+                    anchor: originalChild,
+                    pr: 3519,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.land("root", { repairDepth: 1 });
+          const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+
+        const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+        const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+        const repairedSubjects = yield* shell(repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${mainHead}..${childHead}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("would merge #3517 (root)");
+        expect(result.preview.join("\n")).toContain("would rebase child onto main");
+        expect(result.preview.join("\n")).not.toContain("grandchild");
+        expect(result.applied.join("\n")).toContain("next root: child");
+        expect(result.applied.join("\n")).not.toContain("grandchild");
+        expect(repairedSubjects.split("\n")).toEqual(childSubjects);
+        expect(repairedSubjects).not.toContain("consolidate task assignment");
+        expect(repairedSubjects).not.toContain("rely on atomic run claim for assignment");
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+        expect(yield* shell(repo, "git", ["rev-parse", "grandchild"])).toBe(originalGrandchild);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/grandchild"])).toBe(
+          originalGrandchild,
+        );
+        expect(originalRoot).not.toBe(mainHead);
+        expect(log).not.toContain("body 3519");
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
+  it.effect(
     "land trusts a child anchor embedded in the rewritten root history",
     () =>
       Effect.gen(function* () {

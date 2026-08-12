@@ -987,28 +987,46 @@ ${note}`;
                 matchedParentPrefix === 0 &&
                 !savedParentBoundaryVerified
               ) {
-                const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
-                if (Option.isSome(recovered) && recovered.value.kind === "force-push-boundary") {
-                  const { boundary, semanticHead } = recovered.value;
-                  yield* verifyForcePushBoundary(boundary, semanticHead);
-                  const [firstParent, secondParent, thirdParent, embeddedAnchor, sharedAnchor] =
-                    yield* Effect.all([
-                      git.head(`${branch}^1`),
-                      git.head(`${branch}^2`),
-                      git.head(`${branch}^3`),
-                      git.base(savedParent, anchor),
-                      git.base(branch, savedParent),
-                    ]);
-                  savedParentBoundaryVerified =
-                    Option.isSome(firstParent) &&
-                    firstParent.value === semanticHead &&
-                    Option.isSome(secondParent) &&
-                    secondParent.value === anchor &&
-                    Option.isNone(thirdParent) &&
-                    Option.isSome(embeddedAnchor) &&
-                    embeddedAnchor.value === anchor &&
-                    Option.isSome(sharedAnchor) &&
-                    sharedAnchor.value === anchor;
+                const [firstParent, secondParent, embeddedAnchor, sharedAnchor] = yield* Effect.all(
+                  [
+                    git.head(`${savedParent}^1`),
+                    git.head(`${savedParent}^2`),
+                    git.base(savedParent, anchor),
+                    git.base(branch, savedParent),
+                  ],
+                );
+                savedParentBoundaryVerified =
+                  Option.isSome(firstParent) &&
+                  firstParent.value === anchor &&
+                  Option.isNone(secondParent) &&
+                  Option.isSome(embeddedAnchor) &&
+                  embeddedAnchor.value === anchor &&
+                  Option.isSome(sharedAnchor) &&
+                  sharedAnchor.value === anchor;
+                if (!savedParentBoundaryVerified) {
+                  const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
+                  if (Option.isSome(recovered) && recovered.value.kind === "force-push-boundary") {
+                    const { boundary, semanticHead } = recovered.value;
+                    yield* verifyForcePushBoundary(boundary, semanticHead);
+                    const [firstParent, secondParent, thirdParent, embeddedAnchor, sharedAnchor] =
+                      yield* Effect.all([
+                        git.head(`${branch}^1`),
+                        git.head(`${branch}^2`),
+                        git.head(`${branch}^3`),
+                        git.base(savedParent, anchor),
+                        git.base(branch, savedParent),
+                      ]);
+                    savedParentBoundaryVerified =
+                      Option.isSome(firstParent) &&
+                      firstParent.value === semanticHead &&
+                      Option.isSome(secondParent) &&
+                      secondParent.value === anchor &&
+                      Option.isNone(thirdParent) &&
+                      Option.isSome(embeddedAnchor) &&
+                      embeddedAnchor.value === anchor &&
+                      Option.isSome(sharedAnchor) &&
+                      sharedAnchor.value === anchor;
+                  }
                 }
               }
 

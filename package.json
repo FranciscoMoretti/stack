@@ -1,6 +1,6 @@
 {
   "name": "@kitlangton/stack",
-  "version": "0.4.2-anchor-fix.13",
+  "version": "0.4.2-anchor-fix.14",
   "description": "Squash-safe stacked PR/MR repair CLI for GitHub and GitLab",
   "keywords": [
     "cli",
