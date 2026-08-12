@@ -940,6 +940,43 @@ ${note}`;
               let matchedParentPrefix = 0;
               let savedParentBoundaryVerified = false;
 
+              if (savedParent) {
+                const persistedParent = links.get(String(link.parent));
+                if (persistedParent?.pr) {
+                  const savedParentHead = yield* git.head(savedParent);
+                  const recoveredParent = yield* codeHost.replayBase(
+                    Number(persistedParent.pr),
+                    String(persistedParent.parent),
+                  );
+                  if (
+                    Option.isSome(recoveredParent) &&
+                    recoveredParent.value.kind === "force-push-boundary" &&
+                    Option.isSome(savedParentHead) &&
+                    recoveredParent.value.semanticHead === savedParentHead.value
+                  ) {
+                    const { before, boundary, semanticHead } = recoveredParent.value;
+                    const [semanticHeadRef, firstParent, secondParent] = yield* Effect.all([
+                      git.head(semanticHead),
+                      git.head(`${semanticHead}^1`),
+                      git.head(`${semanticHead}^2`),
+                    ]);
+                    if (
+                      Option.isNone(semanticHeadRef) ||
+                      Option.isNone(firstParent) ||
+                      firstParent.value !== boundary ||
+                      Option.isSome(secondParent)
+                    ) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `cannot verify hosted parent rewrite ${before} -> ${semanticHead} for ${branch}`,
+                        ),
+                      );
+                    }
+                    candidates.push(before);
+                  }
+                }
+              }
+
               for (const candidate of candidates) {
                 const [candidateHead, embeddedAnchor, embeddedCandidate] = yield* Effect.all([
                   git.head(candidate),

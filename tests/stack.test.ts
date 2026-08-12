@@ -5063,6 +5063,204 @@ describe("Stack", () => {
   );
 
   it.effect(
+    "land recovers a promoted child's suffix from the rewritten parent's hosted history",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const repo = join(root, "fresh");
+        const log: Array<string> = [];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+
+        yield* commitFile(author, "base.txt", "base\n", "base");
+        const persistedChildAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "schedule-history"]);
+        const scheduleSubjects = [
+          "ALA-2840: bound Schedule collections",
+          "ALA-2840: use an absent initial Schedule cursor",
+          "ALA-2840: make Schedule pagination stable and navigable",
+          "ALA-2840: preserve scoped automation cursors",
+          "ALA-2840: format pagination helper",
+          "ALA-2840: use stable Schedule keyset cursors",
+          "ALA-2840: harden schedule pagination errors",
+          "fix(ui): surface Schedule refresh failures",
+          "REST Compliance 19A.4: Update Schedule OpenAPI snapshot",
+          "fix(api): sort automation exception imports",
+        ];
+        for (const [index, subject] of scheduleSubjects.entries()) {
+          yield* commitFile(author, `schedule-${index}.txt`, `${subject}\n`, subject);
+        }
+        const scheduleHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "historical-parent"]);
+        const triggerSubjects = [
+          "ALA-2841: bound Trigger collections",
+          "ALA-2841: use an absent initial Trigger cursor",
+          "ALA-2841: make Trigger pagination navigable",
+          "ALA-2841: preserve Agent scope across Trigger pages",
+          "ALA-2841: align Trigger cursor ordering",
+          "ALA-2841: preserve triggers after paging errors",
+          "fix(ui): surface Trigger refresh failures",
+          "REST Compliance 19A.5: Update Trigger OpenAPI snapshot",
+        ];
+        const triggerCommits: Array<string> = [];
+        for (const [index, subject] of triggerSubjects.entries()) {
+          yield* commitFile(author, `trigger-${index}.txt`, `${subject}\n`, subject);
+          triggerCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+        }
+        const historicalParent = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "child"]);
+        const childSubjects = [
+          "ALA-2842: return 201 for Schedule creation",
+          "ALA-2842: type the Schedule status test",
+          "REST Compliance 19A.6: Update Schedule OpenAPI snapshot",
+        ];
+        for (const [index, subject] of childSubjects.entries()) {
+          yield* commitFile(author, `child-${index}.txt`, `${subject}\n`, subject);
+        }
+        const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "grandchild.txt", "deeper\n", "deeper trigger layer");
+        const originalGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(author, "git", ["checkout", "main"]);
+        yield* shell(author, "git", ["merge", "--squash", scheduleHead]);
+        yield* shell(author, "git", ["commit", "-m", "merge schedule stack"]);
+        const rootAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "origin", "main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root"]);
+        for (const commit of triggerCommits) {
+          yield* shell(author, "git", ["cherry-pick", commit]);
+        }
+        const rewrittenParent = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        const rewrittenParentBoundary = yield* shell(author, "git", ["rev-parse", "HEAD^"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", [
+          "fetch",
+          "origin",
+          "root:root",
+          "child:child",
+          "grandchild:grandchild",
+        ]);
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo,
+              log,
+              pulls: [
+                pr(3563, "root", "main"),
+                pr(3564, "child", "root"),
+                pr(3565, "grandchild", "child"),
+              ],
+              metas: [
+                metaFor(pr(3563, "root", "main")),
+                metaFor(pr(3564, "child", "root")),
+                metaFor(pr(3565, "grandchild", "child")),
+              ],
+              replayBases: new Map([
+                [
+                  3563,
+                  {
+                    kind: "force-push-boundary",
+                    currentBase: "main",
+                    before: historicalParent,
+                    semanticHead: rewrittenParent,
+                    boundary: rewrittenParentBoundary,
+                  },
+                ],
+              ]),
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({ branch: "root", parent: "main", anchor: rootAnchor, pr: 3563 }),
+                  stackLink({
+                    branch: "child",
+                    parent: "root",
+                    anchor: persistedChildAnchor,
+                    pr: 3564,
+                  }),
+                  stackLink({
+                    branch: "grandchild",
+                    parent: "child",
+                    anchor: originalChild,
+                    pr: 3565,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.land("root", { repairDepth: 1 });
+          const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+
+        const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+        const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+        const repairedSubjects = yield* shell(repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${mainHead}..${childHead}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("would merge #3563 (root)");
+        expect(result.preview.join("\n")).toContain("would rebase child onto main");
+        expect(result.preview.join("\n")).not.toContain("grandchild");
+        expect(result.applied.join("\n")).toContain("next root: child");
+        expect(result.applied.join("\n")).not.toContain("grandchild");
+        expect(repairedSubjects.split("\n")).toEqual(childSubjects);
+        for (const inheritedSubject of [...scheduleSubjects, ...triggerSubjects]) {
+          expect(repairedSubjects).not.toContain(inheritedSubject);
+        }
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+        expect(yield* shell(repo, "git", ["rev-parse", "grandchild"])).toBe(originalGrandchild);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/grandchild"])).toBe(
+          originalGrandchild,
+        );
+        expect(log).not.toContain("body 3565");
+      }).pipe(Effect.provide(platform)),
+    30_000,
+  );
+
+  it.effect(
     "land trusts a child anchor embedded in the rewritten root history",
     () =>
       Effect.gen(function* () {
