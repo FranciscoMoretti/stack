@@ -760,6 +760,183 @@ const verifyDirectParentAnchorLanding = (opts: {
     expect(log).not.toContain("body 3519");
   });
 
+const verifyPreservationRootHistoricalChildLanding = (opts?: {
+  readonly failure?: "ambiguous-composition" | "moved-lineage" | "patch-drift";
+}) =>
+  Effect.gen(function* () {
+    const root = yield* tempDir();
+    const origin = join(root, "origin.git");
+    const author = join(root, "author");
+    const repo = join(root, "fresh");
+    const log: Array<string> = [];
+
+    yield* shell(root, "git", ["init", "--bare", origin]);
+    yield* mkdirp(author);
+    yield* shell(author, "git", ["init", "-b", "main"]);
+    yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(author, "git", ["remote", "add", "origin", origin]);
+    yield* commitFile(author, "base.txt", "base\n", "base");
+    yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+    yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "root"]);
+    yield* commitFile(
+      author,
+      "task-conflict.txt",
+      "annotated conflict\n",
+      "fix(tasks): annotate task-order conflict initializer",
+    );
+    const childAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "child"]);
+    const childSubjects = [
+      "refactor(api): model matter task order as desired state",
+      "fix(api): preserve visible matter task order response",
+    ];
+    const childCommits: Array<string> = [];
+    for (const [index, subject] of childSubjects.entries()) {
+      yield* commitFile(author, `child-${index}.txt`, `${subject}\n`, subject);
+      childCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+    }
+    const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+    yield* shell(author, "git", ["checkout", "-b", "descendant"]);
+    yield* commitFile(author, "descendant.txt", "deeper\n", "deeper task-order consumer");
+    const originalDescendant = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "descendant"]);
+
+    yield* shell(author, "git", ["checkout", "main"]);
+    yield* commitFile(author, "trunk.txt", "current main\n", "advance main");
+    const rootAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "origin", "main"]);
+
+    let extraParent: string | null = null;
+    if (opts?.failure === "ambiguous-composition") {
+      yield* shell(author, "git", ["checkout", "-b", "other", "HEAD^"]);
+      yield* commitFile(author, "other.txt", "other parent\n", "other parent");
+      extraParent = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    }
+
+    yield* shell(author, "git", ["checkout", "root"]);
+    yield* shell(author, "git", [
+      "merge",
+      "--no-ff",
+      "main",
+      ...(extraParent ? [extraParent] : []),
+      "-m",
+      "fix(tasks): preserve task-order conflict semantics on current main",
+    ]);
+    const preservationRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    const preservationParents = yield* shell(author, "git", [
+      "show",
+      "-s",
+      "--format=%P",
+      preservationRoot,
+    ]);
+    if (opts?.failure === "ambiguous-composition") {
+      expect(preservationParents.split(" ")).toHaveLength(3);
+    } else {
+      expect(preservationParents.split(" ")).toEqual([childAnchor, rootAnchor]);
+    }
+    yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+    yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+    yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+
+    if (opts?.failure === "moved-lineage") {
+      yield* shell(author, "git", ["checkout", "root"]);
+      yield* commitFile(author, "late-root.txt", "moved\n", "late root move");
+      yield* shell(author, "git", ["push", "origin", "root"]);
+    }
+    if (opts?.failure === "patch-drift") {
+      yield* shell(author, "git", ["checkout", "child"]);
+      yield* put(join(author, "child-1.txt"), "drifted child patch\n");
+      yield* shell(author, "git", ["add", "child-1.txt"]);
+      yield* shell(author, "git", ["commit", "--amend", "--no-edit"]);
+      yield* shell(author, "git", ["push", "--force", "origin", "child"]);
+    }
+
+    const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+      Layer.provide(NodeServices.layer),
+    );
+    const layer = Stack.layer.pipe(
+      Layer.provideMerge(Progress.noop),
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Proc.live),
+      Layer.provideMerge(cfgLayer),
+      Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+      Layer.provideMerge(
+        integrationGitHub({
+          repo,
+          log,
+          pulls: [pr(3811, "root", "main"), pr(3812, "child", "root")],
+          metas: [metaFor(pr(3811, "root", "main")), metaFor(pr(3812, "child", "root"))],
+        }),
+      ),
+      Layer.provideMerge(
+        Store.memory(
+          new StackState({
+            version: 1,
+            links: [
+              stackLink({ branch: "root", parent: "main", anchor: rootAnchor, pr: 3811 }),
+              stackLink({ branch: "child", parent: "root", anchor: childAnchor, pr: 3812 }),
+            ],
+          }),
+        ),
+      ),
+    );
+
+    const operation = Effect.gen(function* () {
+      const stack = yield* Stack;
+      const preview = yield* stack.land("root", { repairDepth: 1 });
+      const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+      return { preview, applied, history: yield* stack.last() };
+    }).pipe(Effect.provide(layer));
+
+    if (opts?.failure) {
+      const error = yield* Effect.flip(operation);
+      expect(String(error)).toContain(
+        opts.failure === "ambiguous-composition"
+          ? "cannot verify current preservation parent"
+          : "remote head",
+      );
+      expect(yield* shell(repo, "git", ["rev-parse", "child"])).toBe(originalChild);
+      expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(
+        originalDescendant,
+      );
+      return;
+    }
+
+    const result = yield* operation;
+    const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+    const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+    const replayedSubjects = yield* shell(repo, "git", [
+      "log",
+      "--reverse",
+      "--first-parent",
+      "--no-merges",
+      "--format=%s",
+      `${mainHead}..${childHead}`,
+    ]);
+
+    expect(result.preview.join("\n")).toContain("would merge #3811 (root)");
+    expect(result.preview.join("\n")).toContain("would rebase child onto main");
+    expect(result.preview.join("\n")).not.toContain("descendant");
+    expect(result.applied.join("\n")).toContain("next root: child");
+    expect(result.applied.join("\n")).not.toContain("descendant");
+    expect(replayedSubjects.split("\n")).toEqual(childSubjects);
+    expect(result.history).toContain("rebase child onto main");
+    expect(result.history).toContain("push child");
+    expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+    expect(yield* shell(repo, "git", ["branch", "--list", "descendant"])).toBe("");
+    expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(originalDescendant);
+    expect(childCommits).toHaveLength(2);
+    expect(log).not.toContain("body 3813");
+  });
+
 const verifyPromotedPreservationParentLanding = (opts: {
   readonly childNumber: number;
   readonly childSubjects: ReadonlyArray<string>;
@@ -6874,6 +7051,25 @@ describe("Stack", () => {
       }).pipe(Effect.provide(platform)),
     20_000,
   );
+
+  it.effect(
+    "lands the historical child from the first parent of the current preservation root",
+    () => verifyPreservationRootHistoricalChildLanding().pipe(Effect.provide(platform)),
+    40_000,
+  );
+
+  for (const [failure, label] of [
+    ["moved-lineage", "a moved current preservation root lineage"],
+    ["patch-drift", "a drifted historical-child patch"],
+    ["ambiguous-composition", "ambiguous current preservation parent composition"],
+  ] as const) {
+    it.effect(
+      `fails closed for ${label}`,
+      () =>
+        verifyPreservationRootHistoricalChildLanding({ failure }).pipe(Effect.provide(platform)),
+      60_000,
+    );
+  }
 
   it.effect(
     "land recovers a promoted child's suffix from the rewritten parent's hosted history",

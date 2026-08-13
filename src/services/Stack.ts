@@ -1202,6 +1202,64 @@ ${note}`;
                   candidate === savedParent ? yield* git.mergeParents(candidate) : [];
                 if (
                   candidate === savedParent &&
+                  persistedParent?.pr &&
+                  link.pr &&
+                  savedParentHead !== null &&
+                  Option.isSome(embeddedCandidate) &&
+                  embeddedCandidate.value === anchor
+                ) {
+                  const preservationParents = yield* git.parents(savedParentHead);
+                  if (preservationParents[0] === anchor && preservationParents.length > 1) {
+                    if (
+                      preservationParents.length !== 2 ||
+                      preservationParents[1] !== String(persistedParent.anchor)
+                    ) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `cannot verify current preservation parent ${savedParentHead} for ${branch}: expected exactly two parents ${anchor} and ${persistedParent.anchor}`,
+                        ),
+                      );
+                    }
+                    const parentRemote = yield* headRemote(
+                      persistedParent.headRepository ?? null,
+                      Number(persistedParent.pr),
+                    );
+                    const childRemote = yield* headRemote(
+                      link.headRepository ?? null,
+                      Number(link.pr),
+                    );
+                    const [remoteParentHead, branchHead, remoteBranchHead] = yield* Effect.all([
+                      git.remoteHead(parentRemote, String(link.parent)),
+                      git.head(branch),
+                      git.remoteHead(childRemote, branch),
+                    ]);
+                    if (
+                      Option.isNone(remoteParentHead) ||
+                      remoteParentHead.value !== savedParentHead
+                    ) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `current preservation parent remote head diverged for ${link.parent}; expected ${savedParentHead}`,
+                        ),
+                      );
+                    }
+                    if (
+                      Option.isNone(branchHead) ||
+                      Option.isNone(remoteBranchHead) ||
+                      remoteBranchHead.value !== branchHead.value
+                    ) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `current preservation child remote head diverged for ${branch}; expected ${Option.getOrNull(branchHead)}`,
+                        ),
+                      );
+                    }
+                    savedParentBoundaryVerified = true;
+                    break;
+                  }
+                }
+                if (
+                  candidate === savedParent &&
                   Option.isSome(embeddedCandidate) &&
                   embeddedCandidate.value === anchor &&
                   preservedMergeParents.includes(anchor)
