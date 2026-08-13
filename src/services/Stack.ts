@@ -1063,9 +1063,15 @@ ${note}`;
                     Number(persistedParent.pr),
                     String(persistedParent.parent),
                   );
+                  const recoveredSemanticHeadRef =
+                    Option.isSome(recoveredParent) &&
+                    recoveredParent.value.kind === "force-push-boundary"
+                      ? yield* git.head(recoveredParent.value.semanticHead)
+                      : Option.none<string>();
                   const recoveredSemanticHead =
                     Option.isSome(recoveredParent) &&
                     recoveredParent.value.kind === "force-push-boundary" &&
+                    Option.isSome(recoveredSemanticHeadRef) &&
                     savedParentHead !== null
                       ? yield* git.base(savedParent, recoveredParent.value.semanticHead)
                       : Option.none<string>();
@@ -1093,7 +1099,47 @@ ${note}`;
                         ),
                       );
                     }
-                    candidates.push(before);
+                    let beforeHead = yield* git.head(before);
+                    if (Option.isNone(beforeHead)) {
+                      const fetchedBefore = yield* git.fetchRef(before).pipe(
+                        Effect.map(Option.some),
+                        Effect.catchTag("ExecError", () => Effect.succeed(Option.none<string>())),
+                      );
+                      if (Option.isSome(fetchedBefore) && fetchedBefore.value !== before) {
+                        return yield* Effect.fail(
+                          new StackOperationError(
+                            `fetched hosted parent rewrite source ${fetchedBefore.value}, expected ${before}`,
+                          ),
+                        );
+                      }
+                      beforeHead = yield* git.head(before);
+                    }
+                    if (Option.isSome(beforeHead)) {
+                      const beforeParents = yield* git.parents(before);
+                      if (beforeParents.length > 2) {
+                        return yield* Effect.fail(
+                          new StackOperationError(
+                            `cannot verify hosted parent rewrite source ${before} for ${branch}: expected at most two parents`,
+                          ),
+                        );
+                      }
+                      if (beforeParents.length === 2) {
+                        const [preservedPatch, repairedPatch] = yield* Effect.all([
+                          git.patch(beforeParents[1]!, before),
+                          git.patch(boundary, semanticHead),
+                        ]);
+                        if (preservedPatch !== repairedPatch) {
+                          return yield* Effect.fail(
+                            new StackOperationError(
+                              `cannot verify hosted preservation repair ${before} -> ${semanticHead} for ${branch}: semantic patches differ`,
+                            ),
+                          );
+                        }
+                        candidates.push(beforeParents[0]!);
+                      } else {
+                        candidates.push(before);
+                      }
+                    }
                   }
                 }
               }

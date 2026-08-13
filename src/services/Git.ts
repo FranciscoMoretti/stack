@@ -43,6 +43,7 @@ export interface Interface {
   ) => Effect.Effect<ReadonlyArray<string>, ExecError>;
   readonly mergeParents: (branch: string) => Effect.Effect<ReadonlyArray<string>, ExecError>;
   readonly parents: (commit: string) => Effect.Effect<ReadonlyArray<string>, ExecError>;
+  readonly patch: (base: string, head: string) => Effect.Effect<string, ExecError>;
   readonly semanticCommits: (
     anchor: string,
     parent: string,
@@ -265,6 +266,9 @@ export const live = Layer.effect(
       run("git", ["rev-list", "--parents", "-n", "1", commit]).pipe(
         Effect.map((out) => out.split(" ").slice(1).filter(Boolean)),
       ),
+    );
+    const patch = Effect.fn("Git.patch")((base: string, head: string) =>
+      run("git", ["diff", "--no-ext-diff", "--full-index", "--binary", base, head]),
     );
     const semanticCommits = Effect.fn("Git.semanticCommits")(function* (
       anchor: string,
@@ -498,6 +502,7 @@ export const live = Layer.effect(
       commits,
       mergeParents,
       parents,
+      patch,
       semanticCommits,
       novel,
       squashBase,
@@ -546,6 +551,7 @@ export const test = (opts: {
       commits: () => Effect.succeed([]),
       mergeParents: () => Effect.succeed([]),
       parents: () => Effect.succeed([]),
+      patch: () => Effect.succeed(""),
       semanticCommits: (_anchor, _parent, _branch) =>
         Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
       novel: (_parent, _branch, commits) => Effect.succeed(commits),

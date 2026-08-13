@@ -92,6 +92,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     commits: () => Effect.succeed([]),
     mergeParents: () => Effect.succeed([]),
     parents: () => Effect.succeed([]),
+    patch: () => Effect.succeed(""),
     semanticCommits: () => Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
     novel: (_parent, _branch, commits) => Effect.succeed(commits),
     squashBase: (parent) => Effect.succeed(parent),
@@ -757,6 +758,232 @@ const verifyDirectParentAnchorLanding = (opts: {
     expect(yield* shell(repo, "git", ["branch", "--list", "descendant"])).toBe("");
     expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(originalDescendant);
     expect(log).not.toContain("body 3519");
+  });
+
+const verifyPromotedPreservationParentLanding = (opts: {
+  readonly childNumber: number;
+  readonly childSubjects: ReadonlyArray<string>;
+  readonly failure?: "ambiguous-history" | "missing-history" | "moved-parent" | "patch-drift";
+  readonly inheritedSubjects: ReadonlyArray<string>;
+  readonly rootNumber: number;
+  readonly staleAnchorIndex: number;
+}) =>
+  Effect.gen(function* () {
+    const root = yield* tempDir();
+    const origin = join(root, "origin.git");
+    const author = join(root, "author");
+    const repo = join(root, "fresh");
+    const log: Array<string> = [];
+
+    yield* shell(root, "git", ["init", "--bare", origin]);
+    yield* mkdirp(author);
+    yield* shell(author, "git", ["init", "-b", "main"]);
+    yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(author, "git", ["remote", "add", "origin", origin]);
+    yield* commitFile(author, "base.txt", "base\n", "base");
+    const base = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+    yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "prior-root"]);
+    yield* commitFile(author, "root.txt", "current root\n", "current lower root");
+    const priorRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "old-parent", "main"]);
+    const inheritedCommits: Array<string> = [];
+    for (const [index, subject] of opts.inheritedSubjects.entries()) {
+      yield* commitFile(author, `inherited-${index}.txt`, `${subject}\n`, subject);
+      inheritedCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+    }
+    const oldParent = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+    if (opts.failure === "ambiguous-history") {
+      yield* shell(author, "git", ["checkout", "-b", "other-root", "main"]);
+      yield* commitFile(author, "other-root.txt", "other root\n", "other root");
+      yield* shell(author, "git", ["checkout", "old-parent"]);
+      yield* shell(author, "git", ["merge", "--no-ff", "--no-commit", "prior-root", "other-root"]);
+    } else {
+      yield* shell(author, "git", ["merge", "--no-ff", "--no-commit", "prior-root"]);
+    }
+    yield* put(join(author, "promoted.txt"), "canonical promoted patch\n");
+    yield* shell(author, "git", ["add", "promoted.txt"]);
+    yield* shell(author, "git", ["commit", "-m", "Merge canonical parent update base"]);
+    const preservationHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    const preservationPatch = yield* shell(author, "git", [
+      "diff",
+      "--no-ext-diff",
+      "--full-index",
+      "--binary",
+      priorRoot,
+      preservationHead,
+    ]);
+
+    yield* shell(author, "git", ["checkout", "main"]);
+    yield* commitFile(author, "trunk.txt", "advanced trunk\n", "advance trunk");
+    const repairedBoundary = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["checkout", "-B", "root"]);
+    yield* shell(author, "git", ["cherry-pick", "-m", "2", preservationHead]);
+    if (opts.failure === "patch-drift") {
+      yield* put(join(author, "promoted.txt"), "drifted promoted patch\n");
+      yield* shell(author, "git", ["add", "promoted.txt"]);
+      yield* shell(author, "git", ["commit", "--amend", "--no-edit"]);
+    }
+    const repairedRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    let hostedSemanticHead = repairedRoot;
+    const repairedPatch = yield* shell(author, "git", [
+      "diff",
+      "--no-ext-diff",
+      "--full-index",
+      "--binary",
+      repairedBoundary,
+      repairedRoot,
+    ]);
+    if (opts.failure === "patch-drift") expect(repairedPatch).not.toBe(preservationPatch);
+    else expect(repairedPatch).toBe(preservationPatch);
+    yield* shell(author, "git", ["push", "-u", "origin", "main", "root"]);
+    if (opts.failure !== "missing-history") {
+      yield* shell(author, "git", [
+        "push",
+        "origin",
+        `${preservationHead}:refs/pull/${opts.rootNumber}/history`,
+      ]);
+    }
+
+    yield* shell(author, "git", ["checkout", "-b", "child", oldParent]);
+    for (const [index, subject] of opts.childSubjects.entries()) {
+      yield* commitFile(author, `child-${index}.txt`, `${subject}\n`, subject);
+    }
+    const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+    yield* shell(author, "git", ["checkout", "-b", "descendant"]);
+    yield* commitFile(author, "descendant.txt", "deeper\n", "deeper untouched layer");
+    const originalDescendant = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "descendant"]);
+
+    yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+    yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+    if (opts.failure === "moved-parent") {
+      yield* shell(author, "git", ["checkout", "root"]);
+      yield* commitFile(author, "late-root.txt", "late root\n", "late remote root move");
+      hostedSemanticHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+      yield* shell(author, "git", ["push", "--force", "origin", "root"]);
+    }
+
+    const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+      Layer.provide(NodeServices.layer),
+    );
+    const layer = Stack.layer.pipe(
+      Layer.provideMerge(Progress.noop),
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Proc.live),
+      Layer.provideMerge(cfgLayer),
+      Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+      Layer.provideMerge(
+        integrationGitHub({
+          repo,
+          log,
+          pulls: [
+            pr(opts.rootNumber, "root", "main"),
+            pr(opts.childNumber, "child", "root"),
+            pr(opts.childNumber + 1, "descendant", "child"),
+          ],
+          metas: [
+            metaFor(pr(opts.rootNumber, "root", "main")),
+            metaFor(pr(opts.childNumber, "child", "root")),
+            metaFor(pr(opts.childNumber + 1, "descendant", "child")),
+          ],
+          replayBases: new Map([
+            [
+              opts.rootNumber,
+              {
+                kind: "force-push-boundary",
+                currentBase: "main",
+                before: preservationHead,
+                semanticHead: hostedSemanticHead,
+                boundary: repairedBoundary,
+              },
+            ],
+          ]),
+        }),
+      ),
+      Layer.provideMerge(
+        Store.memory(
+          new StackState({
+            version: 1,
+            links: [
+              stackLink({
+                branch: "root",
+                parent: "main",
+                anchor: repairedBoundary,
+                pr: opts.rootNumber,
+              }),
+              stackLink({
+                branch: "child",
+                parent: "root",
+                anchor: inheritedCommits[opts.staleAnchorIndex] ?? base,
+                pr: opts.childNumber,
+              }),
+              stackLink({
+                branch: "descendant",
+                parent: "child",
+                anchor: originalChild,
+                pr: opts.childNumber + 1,
+              }),
+            ],
+          }),
+        ),
+      ),
+    );
+
+    const operation = Effect.gen(function* () {
+      const stack = yield* Stack;
+      const preview = yield* stack.land("root", { repairDepth: 1 });
+      const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+      return { preview, applied };
+    }).pipe(Effect.provide(layer));
+
+    if (opts.failure) {
+      const error = yield* Effect.flip(operation);
+      const expected = {
+        "ambiguous-history": "expected at most two parents",
+        "missing-history": "semantic replay boundary required",
+        "moved-parent": "semantic replay boundary required",
+        "patch-drift": "semantic patches differ",
+      }[opts.failure];
+      expect(String(error)).toContain(expected);
+      expect(yield* shell(repo, "git", ["rev-parse", "child"])).toBe(originalChild);
+      expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(originalChild);
+      expect(yield* shell(repo, "git", ["branch", "--list", "descendant"])).toBe("");
+      expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(
+        originalDescendant,
+      );
+      return;
+    }
+    const result = yield* operation;
+
+    const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+    const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+    const replayedSubjects = yield* shell(repo, "git", [
+      "log",
+      "--reverse",
+      "--first-parent",
+      "--no-merges",
+      "--format=%s",
+      `${mainHead}..${childHead}`,
+    ]);
+    expect(result.preview.join("\n")).toContain(`would merge #${opts.rootNumber} (root)`);
+    expect(result.preview.join("\n")).toContain("would rebase child onto main");
+    expect(result.preview.join("\n")).not.toContain("descendant");
+    expect(result.applied.join("\n")).toContain("next root: child");
+    expect(replayedSubjects.split("\n")).toEqual(opts.childSubjects);
+    for (const subject of opts.inheritedSubjects) expect(replayedSubjects).not.toContain(subject);
+    expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+    expect(yield* shell(repo, "git", ["branch", "--list", "descendant"])).toBe("");
+    expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(originalDescendant);
+    expect(log).not.toContain(`body ${opts.childNumber + 1}`);
   });
 
 const cfg = StackConfig.layer({ root: "/tmp/stack", trunks: ["dev"] }).pipe(
@@ -7319,6 +7546,64 @@ describe("Stack", () => {
       }).pipe(Effect.provide(platform)),
     20_000,
   );
+
+  it.effect(
+    "lands the Tasks child from the first parent of a patch-equivalent promoted repair",
+    () =>
+      verifyPromotedPreservationParentLanding({
+        rootNumber: 3521,
+        childNumber: 3522,
+        inheritedSubjects: [
+          "REST Compliance 15A.4: Update task OpenAPI snapshot",
+          "preserve task filing",
+          "preserve task assignment",
+          "preserve task notification",
+        ],
+        childSubjects: ["REST Compliance 15B.1: Add task flag state foundation"],
+        staleAnchorIndex: 0,
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
+  it.effect(
+    "lands the Folder child from a stale anchor through a patch-equivalent promoted repair",
+    () =>
+      verifyPromotedPreservationParentLanding({
+        rootNumber: 3853,
+        childNumber: 3856,
+        inheritedSubjects: [
+          "fix(api): return created status for folders",
+          "test(api): expect created folder responses",
+          "feat(api): add canonical folder update contract",
+          "refactor(dashboard): centralize folder mutations",
+          "fix(dashboard): report folder rename failures",
+        ],
+        childSubjects: ["refactor(dashboard): use canonical folder updates for moves"],
+        staleAnchorIndex: -1,
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
+  for (const [failure, label] of [
+    ["missing-history", "missing hosted repair history"],
+    ["ambiguous-history", "an ambiguous preservation merge"],
+    ["moved-parent", "a moved remote parent"],
+    ["patch-drift", "repair composition drift"],
+  ] as const) {
+    it.effect(
+      `fails closed for ${label} while recovering a promoted parent`,
+      () =>
+        verifyPromotedPreservationParentLanding({
+          rootNumber: 3521,
+          childNumber: 3522,
+          inheritedSubjects: ["inherited parent layer", "inherited review layer"],
+          childSubjects: ["child semantic layer"],
+          staleAnchorIndex: -1,
+          failure,
+        }).pipe(Effect.provide(platform)),
+      20_000,
+    );
+  }
 
   it.effect(
     "land trusts a child anchor embedded in the child's preservation merge",
