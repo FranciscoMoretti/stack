@@ -75,10 +75,18 @@ interface AuditedReplayPlan {
   readonly parent: string;
   readonly onto: string;
   readonly commits: ReadonlyArray<string>;
+  readonly mainline: number | null;
+  readonly mergeParents: ReadonlyArray<string>;
   readonly remoteHeads: ReadonlyArray<{
     readonly remote: string;
     readonly head: string | null;
   }>;
+}
+
+interface ReplaySelection {
+  readonly commits: ReadonlyArray<string>;
+  readonly mainline: number | null;
+  readonly mergeParents: ReadonlyArray<string>;
 }
 
 export class Stack extends Context.Service<Stack, StackService>()("@stack/Stack") {
@@ -215,6 +223,9 @@ ${note}`;
             "",
             "Audited commits:",
             ...rebase.commits.map((commit) => `  ${commit}`),
+            ...(rebase.mainline === undefined
+              ? []
+              : ["", `Merge mainline parent: ${rebase.mainline}`]),
             ...(err._tag === "ReplayConflictError" && err.paths.length > 0
               ? ["", "Conflicting paths:", ...err.paths.map((path) => `  ${path}`)]
               : []),
@@ -923,6 +934,11 @@ ${note}`;
               parent: string,
               onto: string,
             ) {
+              const linearSelection = (commits: ReadonlyArray<string>): ReplaySelection => ({
+                commits,
+                mainline: null,
+                mergeParents: [],
+              });
               const branch = String(link.branch);
               const anchor = replayAnchors.get(branch) ?? String(link.anchor);
               const savedParent = saved.get(String(link.parent));
@@ -930,6 +946,8 @@ ${note}`;
               if (audited) {
                 const currentRange = yield* git.commits(anchor, branch);
                 const branchHead = Option.getOrNull(yield* git.head(branch));
+                const currentMergeParents =
+                  audited.mainline === null ? [] : yield* git.parents(audited.branchHead);
                 const savedParentHead = savedParent
                   ? Option.getOrNull(yield* git.head(savedParent))
                   : null;
@@ -943,6 +961,14 @@ ${note}`;
                   anchor !== audited.anchor ? "anchor" : null,
                   parent !== audited.parent ? "resolved parent" : null,
                   onto !== audited.onto ? "target ref" : null,
+                  audited.mainline !== null &&
+                  (currentMergeParents.length !== audited.mergeParents.length ||
+                    currentMergeParents.some(
+                      (commit, index) => commit !== audited.mergeParents[index],
+                    ))
+                    ? "merge composition"
+                    : null,
+                  audited.mainline === null &&
                   audited.commits.some((commit) => !currentRangeCommits.has(commit))
                     ? "semantic range"
                     : null,
@@ -954,7 +980,11 @@ ${note}`;
                     ),
                   );
                 }
-                return Array.from(audited.commits);
+                return {
+                  commits: Array.from(audited.commits),
+                  mainline: audited.mainline,
+                  mergeParents: Array.from(audited.mergeParents),
+                } satisfies ReplaySelection;
               }
               const savedParentHead = savedParent
                 ? Option.getOrNull(yield* git.head(savedParent))
@@ -996,7 +1026,9 @@ ${note}`;
                   if (recovered.value.kind === "force-push-boundary") {
                     const { boundary, semanticHead } = recovered.value;
                     yield* verifyForcePushBoundary(boundary, semanticHead);
-                    return yield* git.novel(onto, branch, yield* git.commits(boundary, branch));
+                    return linearSelection(
+                      yield* git.novel(onto, branch, yield* git.commits(boundary, branch)),
+                    );
                   } else {
                     const fetchedHead = yield* git.fetchRef(recovered.value.fetchRef);
                     if (fetchedHead !== recovered.value.head) {
@@ -1019,6 +1051,8 @@ ${note}`;
               }
               const all = yield* git.commits(anchor, branch);
               let selected = all;
+              let selectedMainline: number | null = null;
+              let selectedMergeParents: ReadonlyArray<string> = [];
               let matchedParentPrefix = 0;
               let savedParentBoundaryVerified = false;
               const persistedParent = savedParent ? links.get(String(link.parent)) : undefined;
@@ -1086,7 +1120,30 @@ ${note}`;
                       embeddedParent.value === anchor &&
                       Option.isSome(remoteParentHead) &&
                       remoteParentHead.value === anchor;
-                    if (savedParentBoundaryVerified) break;
+                    if (savedParentBoundaryVerified) {
+                      const branchHead = yield* git.head(branch);
+                      if (Option.isNone(branchHead)) {
+                        return yield* Effect.fail(
+                          new StackOperationError(
+                            `cannot resolve append-only preservation merge head for ${branch}`,
+                          ),
+                        );
+                      }
+                      const branchParents = yield* git.parents(branchHead.value);
+                      if (branchParents.length > 1) {
+                        if (branchParents.length !== 2 || branchParents[1] !== anchor) {
+                          return yield* Effect.fail(
+                            new StackOperationError(
+                              `cannot verify append-only preservation merge for ${branch}: expected exactly two parents with ${anchor} as parent 2`,
+                            ),
+                          );
+                        }
+                        selected = [branchHead.value];
+                        selectedMainline = 2;
+                        selectedMergeParents = branchParents;
+                      }
+                      break;
+                    }
                   }
                   continue;
                 }
@@ -1186,7 +1243,14 @@ ${note}`;
                 );
               }
 
-              return yield* git.novel(onto, branch, selected);
+              if (selectedMainline !== null) {
+                return {
+                  commits: selected,
+                  mainline: selectedMainline,
+                  mergeParents: selectedMergeParents,
+                } satisfies ReplaySelection;
+              }
+              return linearSelection(yield* git.novel(onto, branch, selected));
             });
 
             const resolve = (name: string, seen = new Set<string>()): string | null => {
@@ -1351,7 +1415,7 @@ ${note}`;
                     ),
                   );
                 }
-                const commitsToReplay = yield* commitsForReplay(link, parent, onto);
+                const replaySelection = yield* commitsForReplay(link, parent, onto);
                 if (opts.captureReplayPlans) {
                   const branchHead = yield* git.head(String(link.branch));
                   if (Option.isNone(branchHead)) {
@@ -1387,7 +1451,9 @@ ${note}`;
                     anchor: replayAnchors.get(String(link.branch)) ?? String(link.anchor),
                     parent,
                     onto,
-                    commits: Array.from(commitsToReplay),
+                    commits: Array.from(replaySelection.commits),
+                    mainline: replaySelection.mainline,
+                    mergeParents: Array.from(replaySelection.mergeParents),
                     remoteHeads,
                   });
                 }
@@ -1397,13 +1463,21 @@ ${note}`;
                   parent,
                   onto,
                   backup,
-                  commits: commitsToReplay,
+                  commits: replaySelection.commits,
+                  ...(replaySelection.mainline === null
+                    ? {}
+                    : { mainline: replaySelection.mainline }),
                   pushRemotes: targetRemotes,
                 } satisfies RepairPlan.RebaseBranchPlan;
                 if (opts.preflightReplays) {
                   const preflightParent = opts.preflightOnto?.get(rebase.branch) ?? rebase.onto;
                   yield* git
-                    .preflightReplay(rebase.branch, preflightParent, rebase.commits)
+                    .preflightReplay(
+                      rebase.branch,
+                      preflightParent,
+                      rebase.commits,
+                      rebase.mainline,
+                    )
                     .pipe(
                       Effect.mapError((error) =>
                         replayPreflightFailure(rebase, preflightParent, error),

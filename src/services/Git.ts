@@ -42,6 +42,7 @@ export interface Interface {
     branch: string,
   ) => Effect.Effect<ReadonlyArray<string>, ExecError>;
   readonly mergeParents: (branch: string) => Effect.Effect<ReadonlyArray<string>, ExecError>;
+  readonly parents: (commit: string) => Effect.Effect<ReadonlyArray<string>, ExecError>;
   readonly semanticCommits: (
     anchor: string,
     parent: string,
@@ -57,11 +58,13 @@ export interface Interface {
     branch: string,
     parent: string,
     commits: ReadonlyArray<string>,
+    mainline?: number,
   ) => Effect.Effect<void, ExecError | ReplayConflictError>;
   readonly replay: (
     branch: string,
     parent: string,
     commits: ReadonlyArray<string>,
+    mainline?: number,
   ) => Effect.Effect<void, ExecError | ReplayConflictError>;
   readonly unmergedPaths: () => Effect.Effect<ReadonlyArray<string>, ExecError>;
   readonly release: (branch: string) => Effect.Effect<void, ExecError>;
@@ -258,6 +261,11 @@ export const live = Layer.effect(
         ),
       ),
     );
+    const parents = Effect.fn("Git.parents")((commit: string) =>
+      run("git", ["rev-list", "--parents", "-n", "1", commit]).pipe(
+        Effect.map((out) => out.split(" ").slice(1).filter(Boolean)),
+      ),
+    );
     const semanticCommits = Effect.fn("Git.semanticCommits")(function* (
       anchor: string,
       parent: string,
@@ -337,9 +345,15 @@ export const live = Layer.effect(
       branch: string,
       parent: string,
       commits: ReadonlyArray<string>,
+      mainline?: number,
     ) {
       if (commits.length === 0) return;
-      yield* runAt(root, "git", ["cherry-pick", "--empty=drop", ...commits]).pipe(
+      yield* runAt(root, "git", [
+        "cherry-pick",
+        "--empty=drop",
+        ...(mainline === undefined ? [] : ["-m", String(mainline)]),
+        ...commits,
+      ]).pipe(
         Effect.asVoid,
         Effect.catchTag("ExecError", (err) =>
           Effect.gen(function* () {
@@ -355,6 +369,7 @@ export const live = Layer.effect(
       branch: string,
       parent: string,
       commits: ReadonlyArray<string>,
+      mainline?: number,
     ) {
       const now = yield* Clock.currentTimeMillis;
       const worktree = `${cfg.root}/.stack-preflight-${now}-${branch.replaceAll("/", "-")}`;
@@ -364,12 +379,15 @@ export const live = Layer.effect(
         [0, 1, 128],
       ).pipe(Effect.asVoid, Effect.orDie);
       yield* run("git", ["worktree", "add", "--detach", worktree, parent]).pipe(Effect.asVoid);
-      yield* cherryPickAt(worktree, branch, parent, commits).pipe(Effect.ensuring(removeWorktree));
+      yield* cherryPickAt(worktree, branch, parent, commits, mainline).pipe(
+        Effect.ensuring(removeWorktree),
+      );
     });
     const replay = Effect.fn("Git.replay")(function* (
       branch: string,
       parent: string,
       commits: ReadonlyArray<string>,
+      mainline?: number,
     ) {
       const owner = (yield* worktrees()).find((worktree) => worktree.branch === branch) ?? null;
       if (owner && owner.dirty.length > 0) {
@@ -394,7 +412,7 @@ export const live = Layer.effect(
 
       yield* Effect.gen(function* () {
         yield* runAt(root, "git", ["checkout", "-B", temp, parent]).pipe(Effect.asVoid);
-        yield* cherryPickAt(root, branch, parent, commits);
+        yield* cherryPickAt(root, branch, parent, commits, mainline);
         if (owner) {
           yield* runAt(root, "git", ["checkout", branch]).pipe(Effect.asVoid);
           yield* runAt(root, "git", ["reset", "--hard", temp]).pipe(Effect.asVoid);
@@ -479,6 +497,7 @@ export const live = Layer.effect(
       base,
       commits,
       mergeParents,
+      parents,
       semanticCommits,
       novel,
       squashBase,
@@ -526,6 +545,7 @@ export const test = (opts: {
         Effect.succeed(Option.fromNullishOr(opts.bases?.[`${branch}:${parent}`])),
       commits: () => Effect.succeed([]),
       mergeParents: () => Effect.succeed([]),
+      parents: () => Effect.succeed([]),
       semanticCommits: (_anchor, _parent, _branch) =>
         Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
       novel: (_parent, _branch, commits) => Effect.succeed(commits),

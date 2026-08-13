@@ -54,7 +54,7 @@ export const applyRebaseBranch = Effect.fn("RepairExecution.applyRebaseBranch")(
   });
   yield* deps.step(`rebase ${plan.branch} onto ${plan.parent}`);
   yield* deps.git
-    .replay(plan.branch, plan.onto, plan.commits)
+    .replay(plan.branch, plan.onto, plan.commits, plan.mainline)
     .pipe(Effect.mapError(deps.onReplayFailure));
   const replayedHead = yield* deps.git.head(plan.branch);
   if (Option.isNone(replayedHead) || replayedHead.value === originalHead.value) {

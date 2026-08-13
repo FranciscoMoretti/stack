@@ -91,6 +91,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     base: () => Effect.succeed(Option.none()),
     commits: () => Effect.succeed([]),
     mergeParents: () => Effect.succeed([]),
+    parents: () => Effect.succeed([]),
     semanticCommits: () => Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
     novel: (_parent, _branch, commits) => Effect.succeed(commits),
     squashBase: (parent) => Effect.succeed(parent),
@@ -5443,6 +5444,108 @@ describe("Stack", () => {
     }).pipe(Effect.provide(test.layer));
   });
 
+  const preservationMergePlan = (opts: {
+    readonly initialParents: ReadonlyArray<string>;
+    readonly movedRoot?: boolean;
+    readonly changeCompositionAfterRootDrop?: boolean;
+  }) => {
+    let parents = Array.from(opts.initialParents);
+    const replayed: Array<{ readonly commits: ReadonlyArray<string>; readonly mainline?: number }> =
+      [];
+    const test = makeLand([], "stack-a", null, {
+      base: (branch, parent) => {
+        if (branch === "stack-a" && parent === "dev") return Effect.succeed(Option.some("dev-1"));
+        if (branch === "stack-b" && (parent === "stack-a" || parent.startsWith("backup/landed-"))) {
+          return Effect.succeed(Option.some("stack-a-1"));
+        }
+        if (branch === "stack-b" && parent === "origin/dev") {
+          return Effect.succeed(Option.some("dev-1"));
+        }
+        if (branch === "stack-c" && parent === "stack-b") {
+          return Effect.succeed(Option.some("stack-b-1"));
+        }
+        return Effect.succeed(Option.none());
+      },
+      commits: (from, branch) =>
+        Effect.succeed(from === "stack-a-1" && branch === "stack-b" ? ["old-1", "old-2"] : []),
+      parents: (commit) =>
+        Effect.succeed(commit === "stack-b-1" ? parents : (["linear-parent"] as const)),
+      remoteHead: (_remote, branch) =>
+        Effect.succeed(
+          Option.some(branch === "stack-a" && opts.movedRoot ? "moved-root" : `${branch}-1`),
+        ),
+      preflightReplay: () => Effect.void,
+      replay: (_branch, _parent, commits, mainline) =>
+        Effect.sync(() => {
+          replayed.push({ commits: Array.from(commits), ...(mainline ? { mainline } : {}) });
+        }),
+      drop: (branch) =>
+        Effect.sync(() => {
+          if (branch === "stack-a" && opts.changeCompositionAfterRootDrop) {
+            parents = ["changed-old-child", "stack-a-1"];
+          }
+        }),
+    });
+    return { ...test, replayed };
+  };
+
+  it.effect("land fails closed when a preservation merge has the wrong second parent", () => {
+    const test = preservationMergePlan({ initialParents: ["old-child", "wrong-root"] });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const error = yield* Effect.flip(stack.land("stack-a", { repairDepth: 1 }));
+
+      expect(String(error)).toContain("expected exactly two parents with stack-a-1 as parent 2");
+      expect(test.replayed).toEqual([]);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("land fails closed when the remote preservation root moved", () => {
+    const test = preservationMergePlan({
+      initialParents: ["old-child", "stack-a-1"],
+      movedRoot: true,
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const error = yield* Effect.flip(stack.land("stack-a", { repairDepth: 1 }));
+
+      expect(String(error)).toContain("semantic replay boundary required");
+      expect(test.replayed).toEqual([]);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("land fails closed for an octopus preservation merge", () => {
+    const test = preservationMergePlan({
+      initialParents: ["old-child", "stack-a-1", "unexpected-third-parent"],
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const error = yield* Effect.flip(stack.land("stack-a", { repairDepth: 1 }));
+
+      expect(String(error)).toContain("expected exactly two parents with stack-a-1 as parent 2");
+      expect(test.replayed).toEqual([]);
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("land rejects changed preservation merge composition before replay", () => {
+    const test = preservationMergePlan({
+      initialParents: ["old-child", "stack-a-1"],
+      changeCompositionAfterRootDrop: true,
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const error = yield* Effect.flip(stack.land("stack-a", { apply: true, repairDepth: 1 }));
+
+      expect(String(error)).toContain("audited replay plan diverged");
+      expect(String(error)).toContain("merge composition");
+      expect(test.replayed).toEqual([]);
+    }).pipe(Effect.provide(test.layer));
+  });
+
   it.effect("land bounds descendant repair depth and preserves deeper links", () => {
     const planTest = makeLand();
     const doneTest = makeLand();
@@ -6231,6 +6334,285 @@ describe("Stack", () => {
         expect(recoveryLog).not.toContain("body 3519");
       }).pipe(Effect.provide(platform)),
     45_000,
+  );
+
+  it.effect(
+    "replays an append-only preservation merge against its exact root parent",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const repo = join(root, "fresh");
+        const log: Array<string> = [];
+        const endpointFiles = [
+          "route.py",
+          "schemas.py",
+          "AssignTaskRequest.json",
+          "ChangeTaskStatusRequest.json",
+          "assign-post.json",
+          "status-patch.json",
+          "test_tasks_route.py",
+        ];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+        yield* put(join(author, "factory.py"), "factory = 'base'\n");
+        for (const file of endpointFiles) {
+          yield* put(join(author, file), `legacy endpoint ${file}\n`);
+        }
+        yield* shell(author, "git", ["add", "."]);
+        yield* shell(author, "git", ["commit", "-m", "base"]);
+        const mainAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root"]);
+        yield* commitFile(
+          author,
+          "factory.py",
+          "factory = 'current root'\n",
+          "refresh linked email task projections",
+        );
+        const currentRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "old-child", "main"]);
+        yield* commitFile(
+          author,
+          "factory.py",
+          "factory = 'historical child'\n",
+          "historical task factory migration",
+        );
+        yield* shell(author, "git", ["rm", ...endpointFiles]);
+        yield* shell(author, "git", ["commit", "-m", "remove task command endpoints"]);
+        const oldChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+        const proc = yield* Proc.Service;
+        yield* proc.exec(
+          author,
+          "git",
+          ["merge", "--no-ff", "root", "-m", "Merge canonical task update base"],
+          [0, 1],
+        );
+        yield* put(join(author, "factory.py"), "factory = 'current root'\n");
+        yield* shell(author, "git", ["add", "factory.py"]);
+        yield* shell(author, "git", ["commit", "--no-edit"]);
+        yield* shell(author, "git", ["branch", "-m", "child"]);
+        const preservationMerge = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        expect(yield* shell(author, "git", ["rev-parse", "HEAD^1"])).toBe(oldChild);
+        expect(yield* shell(author, "git", ["rev-parse", "HEAD^2"])).toBe(currentRoot);
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "consumer.py", "consumer\n", "migrate task UI actions");
+        const originalGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo,
+              log,
+              pulls: [pr(3520, "root", "main"), pr(3521, "child", "root")],
+              metas: [metaFor(pr(3520, "root", "main")), metaFor(pr(3521, "child", "root"))],
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({ branch: "root", parent: "main", anchor: mainAnchor, pr: 3520 }),
+                  stackLink({
+                    branch: "child",
+                    parent: "root",
+                    anchor: currentRoot,
+                    pr: 3521,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.land("root", { repairDepth: 1 });
+          const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+
+        const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+        const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+        const childSubjects = yield* shell(repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${mainHead}..${childHead}`,
+        ]);
+        const changedFiles = yield* shell(repo, "git", [
+          "diff",
+          "--name-only",
+          mainHead,
+          childHead,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("would merge #3520 (root)");
+        expect(result.preview.join("\n")).toContain("would rebase child onto main");
+        expect(result.preview.join("\n")).not.toContain("grandchild");
+        expect(result.applied.join("\n")).toContain("next root: child");
+        expect(result.applied.join("\n")).not.toContain("grandchild");
+        expect(childSubjects.split("\n")).toEqual(["Merge canonical task update base"]);
+        expect(changedFiles.split("\n")).toEqual([...endpointFiles].sort());
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+        expect(yield* shell(repo, "git", ["branch", "--list", "grandchild"])).toBe("");
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/grandchild"])).toBe(
+          originalGrandchild,
+        );
+        expect(preservationMerge).not.toBe(childHead);
+        expect(log).not.toContain("body 3522");
+      }).pipe(Effect.provide(platform)),
+    25_000,
+  );
+
+  it.effect(
+    "replays the Folder conflict-repair merge as its parent-2 semantic patch",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const repo = join(root, "fresh");
+        const folderFiles = [
+          "create-folder-dialog.tsx",
+          "use-create-folder.ts",
+          "rename-folder-dialog.test.tsx",
+          "rename-folder-dialog.tsx",
+          "use-file-rename.test.ts",
+          "use-file-rename.ts",
+          "delete-folder-dialog.tsx",
+          "use-file-upload.ts",
+          "use-file-system-mutations.ts",
+          "use-folder-mutations.test.ts",
+          "use-folder-mutations.ts",
+        ];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+        for (const file of folderFiles) yield* put(join(author, file), `legacy ${file}\n`);
+        yield* shell(author, "git", ["add", "."]);
+        yield* shell(author, "git", ["commit", "-m", "base"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root"]);
+        yield* commitFile(
+          author,
+          "use-file-rename.ts",
+          "canonical folder update contract\n",
+          "add canonical folder update contract",
+        );
+        const currentRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "old-child", "main"]);
+        yield* commitFile(
+          author,
+          "use-file-rename.ts",
+          "historical rename hook\n",
+          "migrate historical file rename hook",
+        );
+        yield* shell(author, "git", ["rm", "use-create-folder.ts", "use-file-rename.ts"]);
+        for (const file of folderFiles.filter(
+          (name) => name !== "use-create-folder.ts" && name !== "use-file-rename.ts",
+        )) {
+          yield* put(join(author, file), `canonical folder mutation ${file}\n`);
+        }
+        yield* shell(author, "git", ["add", "."]);
+        yield* shell(author, "git", ["commit", "-m", "centralize folder mutation integrations"]);
+        const oldChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+        const proc = yield* Proc.Service;
+        yield* proc.exec(
+          author,
+          "git",
+          ["merge", "--no-ff", "root", "-m", "Merge canonical folder update base"],
+          [0, 1],
+        );
+        yield* shell(author, "git", ["rm", "use-file-rename.ts"]);
+        yield* shell(author, "git", ["commit", "--no-edit"]);
+        yield* shell(author, "git", ["branch", "-m", "child"]);
+        const preservationMerge = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        expect(yield* shell(author, "git", ["rev-parse", "HEAD^1"])).toBe(oldChild);
+        expect(yield* shell(author, "git", ["rev-parse", "HEAD^2"])).toBe(currentRoot);
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "folder-consumer.ts", "consumer\n", "migrate folder consumer");
+        const grandchildHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+        const expectedPatch = yield* shell(repo, "git", [
+          "diff",
+          "--binary",
+          currentRoot,
+          preservationMerge,
+        ]);
+        yield* shell(repo, "git", ["checkout", "main"]);
+        yield* shell(repo, "git", ["merge", "--squash", "root"]);
+        yield* shell(repo, "git", ["commit", "-m", "merge root"]);
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        yield* Effect.gen(function* () {
+          const git = yield* Git.Service;
+          yield* git.preflightReplay("child", "main", [preservationMerge], 2);
+          yield* git.replay("child", "main", [preservationMerge], 2);
+        }).pipe(
+          Effect.provide(
+            Git.live.pipe(
+              Layer.provideMerge(NodeServices.layer),
+              Layer.provideMerge(Proc.live),
+              Layer.provideMerge(cfgLayer),
+            ),
+          ),
+        );
+
+        const repairedPatch = yield* shell(repo, "git", ["diff", "--binary", "main", "child"]);
+        expect(repairedPatch).toBe(expectedPatch);
+        expect(yield* shell(repo, "git", ["branch", "--list", "grandchild"])).toBe("");
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/grandchild"])).toBe(grandchildHead);
+      }).pipe(Effect.provide(platform)),
+    20_000,
   );
 
   it.effect(

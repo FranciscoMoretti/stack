@@ -6,6 +6,7 @@ export interface RebaseBranchPlan {
   readonly onto: string;
   readonly backup: string;
   readonly commits: ReadonlyArray<string>;
+  readonly mainline?: number;
   readonly pushRemotes: ReadonlyArray<string>;
 }
 
