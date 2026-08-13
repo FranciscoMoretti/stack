@@ -51,6 +51,13 @@ export type StackResultItem =
       readonly base: string;
     }
   | {
+      readonly _tag: "MergePull";
+      readonly mode: Mode;
+      readonly pr: number;
+      readonly branch: string;
+    }
+  | { readonly _tag: "DropLocal"; readonly mode: Mode; readonly branch: string }
+  | {
       readonly _tag: "CreatePull";
       readonly mode: Mode;
       readonly branch: string;
@@ -97,6 +104,10 @@ export const render = (
         : `${prefix(item.mode)}push ${item.branch} to ${item.remotes.join(", ")}`;
     case "RetargetPull":
       return `${prefix(item.mode)}retarget ${reference(item.pr)} to ${item.base}`;
+    case "MergePull":
+      return `${prefix(item.mode)}merge ${reference(item.pr)} (${item.branch})`;
+    case "DropLocal":
+      return `${prefix(item.mode)}drop local ${item.branch}`;
     case "CreatePull":
       return item.mode === "apply" && item.pr !== null
         ? `create ${requestLabel.toLowerCase()} ${reference(item.pr)} for ${item.branch} -> ${item.base}`

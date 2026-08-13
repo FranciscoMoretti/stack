@@ -204,6 +204,26 @@ ${note}`;
             .filter((line): line is string => line !== null)
             .join("\n"),
         );
+      const replayPreflightFailure = (
+        rebase: RepairPlan.RebaseBranchPlan,
+        parent: string,
+        err: StackError,
+      ) =>
+        new StackOperationError(
+          [
+            `replay preflight failed for ${rebase.branch} onto ${rebase.parent} before mutation`,
+            "",
+            "Audited commits:",
+            ...rebase.commits.map((commit) => `  ${commit}`),
+            ...(err._tag === "ReplayConflictError" && err.paths.length > 0
+              ? ["", "Conflicting paths:", ...err.paths.map((path) => `  ${path}`)]
+              : []),
+            "",
+            `The predicted target was ${parent}.`,
+            "No replay or push was performed by this preflight.",
+            "Any earlier completed mutation remains recorded in stack history.",
+          ].join("\n"),
+        );
       const timestamp = Effect.fn("Stack.timestamp")(function* () {
         const now = yield* DateTime.nowAsDate;
         return now.toISOString().replaceAll(":", "").replaceAll(".", "");
@@ -405,6 +425,8 @@ ${note}`;
           case "Rebase":
           case "Push":
           case "CreatePull":
+          case "MergePull":
+          case "DropLocal":
             return action.branch;
           case "RetargetPull":
             return null;
@@ -791,6 +813,8 @@ ${note}`;
             readonly preserveTrunkRoots?: boolean;
             readonly captureReplayPlans?: boolean;
             readonly auditedReplays?: ReadonlyMap<string, AuditedReplayPlan>;
+            readonly preflightReplays?: boolean;
+            readonly preflightOnto?: ReadonlyMap<string, string>;
           },
         ) =>
           Effect.gen(function* () {
@@ -940,6 +964,7 @@ ${note}`;
                 : trunk(parent)
                   ? Array.from(landedBackups)
                   : [];
+              let hostedParentBoundaryVerified = false;
               const verifyForcePushBoundary = Effect.fn(
                 "Stack.repairStack.verifyForcePushBoundary",
               )(function* (boundary: string, semanticHead: string) {
@@ -983,6 +1008,12 @@ ${note}`;
                     }
                     candidates.push(recovered.value.head);
                     candidates.push(...recovered.value.historicalHeads);
+                    if (recovered.value.head === anchor) {
+                      const embeddedParent = yield* git.base(branch, recovered.value.head);
+                      hostedParentBoundaryVerified =
+                        Option.isSome(embeddedParent) &&
+                        embeddedParent.value === recovered.value.head;
+                    }
                   }
                 }
               }
@@ -1145,7 +1176,8 @@ ${note}`;
                 trunk(parent) &&
                 all.length > 1 &&
                 matchedParentPrefix === 0 &&
-                !savedParentBoundaryVerified
+                !savedParentBoundaryVerified &&
+                !hostedParentBoundaryVerified
               ) {
                 return yield* Effect.fail(
                   new StackOperationError(
@@ -1368,6 +1400,16 @@ ${note}`;
                   commits: commitsToReplay,
                   pushRemotes: targetRemotes,
                 } satisfies RepairPlan.RebaseBranchPlan;
+                if (opts.preflightReplays) {
+                  const preflightParent = opts.preflightOnto?.get(rebase.branch) ?? rebase.onto;
+                  yield* git
+                    .preflightReplay(rebase.branch, preflightParent, rebase.commits)
+                    .pipe(
+                      Effect.mapError((error) =>
+                        replayPreflightFailure(rebase, preflightParent, error),
+                      ),
+                    );
+                }
                 const rebaseActions = RepairPlan.rebaseBranch(rebase, mode);
                 if (!apply) actions.push(...rebaseActions);
 
@@ -1642,6 +1684,7 @@ ${note}`;
                   const scopedPulls = yield* changesForLinks(scoped.links, pulls);
                   const repair = yield* repairStack(scoped, refs, scopedPulls, {
                     apply: !dryRun,
+                    preflightReplays: true,
                     journalState: state,
                     replayAnchors,
                     initialActions: scopedInitial,
@@ -2132,10 +2175,6 @@ ${note}`;
                 ];
               }),
             );
-            const beginPostMergeRepair = Effect.fn("Stack.land.beginPostMergeRepair")(function* () {
-              yield* writeScopedState(branches)(landedState);
-              yield* store.clearUndo();
-            });
             const retargetEntries = preRetargets.map((item) =>
               undoEntry({
                 branch: item.branch,
@@ -2153,6 +2192,49 @@ ${note}`;
                 base: item.base,
               }),
             );
+            const landedActions: ReadonlyArray<StackResult.StackResultItem> = [
+              ...(hasLocalTarget
+                ? [
+                    {
+                      _tag: "Backup" as const,
+                      mode: "apply" as const,
+                      branch: target,
+                      backup: name,
+                    },
+                  ]
+                : []),
+              ...retargetActions,
+              {
+                _tag: "MergePull",
+                mode: "apply",
+                pr: Number(pr.number),
+                branch: target,
+              },
+            ];
+            const completedLandingActions: ReadonlyArray<StackResult.StackResultItem> = [
+              ...landedActions,
+              ...(hasLocalTarget
+                ? [{ _tag: "DropLocal" as const, mode: "apply" as const, branch: target }]
+                : []),
+            ];
+            const checkpointLanded = Effect.fn("Stack.land.checkpointLanded")(function* (
+              items: ReadonlyArray<StackResult.StackResultItem>,
+            ) {
+              const latest = yield* store.read();
+              const completedState = mergeState(latest, branches, landedState);
+              yield* store.writeUndo(
+                undoState(
+                  stamp,
+                  completedState,
+                  [],
+                  StackResult.renderAll(items, reference, requestLabel),
+                ),
+              );
+            });
+            const beginPostMergeRepair = Effect.fn("Stack.land.beginPostMergeRepair")(function* () {
+              yield* checkpointLanded(landedActions);
+              yield* writeScopedState(branches)(landedState);
+            });
             const checkpointRetargets = () =>
               retargetEntries.length > 0
                 ? store.writeUndo(
@@ -2182,6 +2264,13 @@ ${note}`;
               scopedState.links.filter((item) => item.branch !== target),
               plannedPulls,
             );
+            const predictedLanding =
+              preRetargets.length > 0 ? yield* git.squashBase(`origin/${root}`, target) : null;
+            const preflightOnto = new Map(
+              preRetargets.flatMap((item) =>
+                predictedLanding === null ? [] : ([[item.branch, predictedLanding]] as const),
+              ),
+            );
             const plannedRepair = yield* repairStack(
               scopedState,
               refs.filter((item) => item.name !== target),
@@ -2190,6 +2279,8 @@ ${note}`;
                 apply: false,
                 saved: new Map([[target, target]]),
                 captureReplayPlans: true,
+                preflightReplays: true,
+                preflightOnto,
               },
             );
             if (active) {
@@ -2233,9 +2324,11 @@ ${note}`;
                     apply: true,
                     saved: new Map([[target, name]]),
                     auditedReplays: plannedRepair.replayPlans,
+                    preflightReplays: true,
                     journalState: nextState,
-                    journalActions: retargetActions,
+                    journalActions: completedLandingActions,
                     writeState: writeScopedState(branches),
+                    preserveUndo: true,
                   },
                 );
                 const repairedPulls = yield* changesForLinks(
@@ -2280,6 +2373,7 @@ ${note}`;
                 }
                 yield* step(`drop local ${target}`);
                 yield* git.drop(target);
+                yield* checkpointLanded(completedLandingActions);
               }
               return yield* repairAfterMerge();
             }

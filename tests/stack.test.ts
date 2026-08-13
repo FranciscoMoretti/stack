@@ -93,6 +93,8 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     mergeParents: () => Effect.succeed([]),
     semanticCommits: () => Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
     novel: (_parent, _branch, commits) => Effect.succeed(commits),
+    squashBase: (parent) => Effect.succeed(parent),
+    preflightReplay: () => Effect.void,
     replay: () => Effect.void,
     unmergedPaths: () => Effect.succeed([] as ReadonlyArray<string>),
     release: () => Effect.void,
@@ -5662,6 +5664,261 @@ describe("Stack", () => {
   );
 
   it.effect(
+    "preflights the Tasks child against the predicted squash and current recovery base",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const landingRepo = join(root, "landing-fresh");
+        const recoveryOrigin = join(root, "recovery-origin.git");
+        const recoveryAuthor = join(root, "recovery-author");
+        const recoveryRepo = join(root, "recovery-fresh");
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+        yield* commitFile(author, "assignment.txt", "assignment: legacy\n", "base");
+        const rootBase = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root"]);
+        yield* commitFile(
+          author,
+          "root-service.txt",
+          "canonical assignment\n",
+          "REST Compliance 15A.3: Consolidate task assignment",
+        );
+        const childFork = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "child"]);
+        const childCommits: Array<string> = [];
+        yield* commitFile(
+          author,
+          "task-route.txt",
+          "canonical patch\n",
+          "REST Compliance 15A.4: Add canonical task state PATCH",
+        );
+        childCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+        yield* commitFile(
+          author,
+          "openapi.txt",
+          "canonical snapshot\n",
+          "REST Compliance 15A.4: Update task OpenAPI snapshot",
+        );
+        childCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+
+        yield* shell(author, "git", ["checkout", "root"]);
+        yield* commitFile(
+          author,
+          "root-lock.txt",
+          "serialize assignment\n",
+          "fix(tasks): rely on atomic run claim for assignment",
+        );
+        const currentRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+
+        yield* shell(author, "git", ["checkout", "child"]);
+        yield* shell(author, "git", [
+          "merge",
+          "--no-ff",
+          "root",
+          "-m",
+          "Merge current task assignment parent",
+        ]);
+        yield* commitFile(
+          author,
+          "assignment.txt",
+          "assignment: converged\n",
+          "Allow converged agent assignment updates",
+        );
+        childCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+        const originalChild = childCommits.at(-1)!;
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "consumer.txt", "consumer\n", "Migrate task state consumers");
+        const originalGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(author, "git", ["checkout", "main"]);
+        yield* commitFile(
+          author,
+          "assignment.txt",
+          "assignment: trunk policy\n",
+          "advance assignment policy on main",
+        );
+        yield* shell(author, "git", ["push", "origin", "main"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, landingRepo]);
+        yield* shell(landingRepo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(landingRepo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(landingRepo, "git", ["fetch", "origin", "root:root", "child:child"]);
+        const landingLog: Array<string> = [];
+        const landingCfg = StackConfig.layer({ root: landingRepo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const landingLayer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(landingCfg),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(landingCfg))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo: landingRepo,
+              log: landingLog,
+              pulls: [
+                pr(3517, "root", "main"),
+                pr(3518, "child", "root"),
+                pr(3519, "grandchild", "child"),
+              ],
+              metas: [
+                metaFor(pr(3517, "root", "main")),
+                metaFor(pr(3518, "child", "root")),
+                metaFor(pr(3519, "grandchild", "child")),
+              ],
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({ branch: "root", parent: "main", anchor: rootBase, pr: 3517 }),
+                  stackLink({ branch: "child", parent: "root", anchor: currentRoot, pr: 3518 }),
+                  stackLink({
+                    branch: "grandchild",
+                    parent: "child",
+                    anchor: originalChild,
+                    pr: 3519,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+        const landing = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const previewError = yield* Effect.flip(stack.land("root", { repairDepth: 1 }));
+          const applyError = yield* Effect.flip(
+            stack.land("root", { apply: true, repairDepth: 1 }),
+          );
+          return { previewError, applyError, history: yield* stack.last() };
+        }).pipe(Effect.provide(landingLayer));
+
+        for (const error of [landing.previewError, landing.applyError]) {
+          expect(String(error)).toContain("replay preflight failed for child");
+          expect(String(error)).toContain("assignment.txt");
+          for (const commit of childCommits) expect(String(error)).toContain(commit);
+        }
+        expect(landingLog).not.toContain("edit 3518 main");
+        expect(landingLog).not.toContain("merge 3517");
+        expect(landing.history).toContain("no applied mutation recorded");
+        expect(yield* shell(landingRepo, "git", ["rev-parse", "origin/child"])).toBe(originalChild);
+        expect(yield* shell(landingRepo, "git", ["rev-parse", "origin/grandchild"])).toBe(
+          originalGrandchild,
+        );
+
+        yield* shell(root, "git", ["clone", "--bare", "--no-local", origin, recoveryOrigin]);
+        yield* shell(root, "git", ["clone", "--no-local", recoveryOrigin, recoveryAuthor]);
+        yield* shell(recoveryAuthor, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(recoveryAuthor, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(recoveryAuthor, "git", ["merge", "--squash", "origin/root"]);
+        yield* shell(recoveryAuthor, "git", ["commit", "-m", "merge root"]);
+        yield* shell(recoveryAuthor, "git", ["push", "origin", "main"]);
+        yield* shell(root, "git", [
+          "--git-dir",
+          recoveryOrigin,
+          "update-ref",
+          "refs/pull/3517/head",
+          currentRoot,
+        ]);
+        yield* shell(recoveryAuthor, "git", ["push", "origin", "--delete", "root"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", recoveryOrigin, recoveryRepo]);
+        yield* shell(recoveryRepo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(recoveryRepo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(recoveryRepo, "git", ["fetch", "origin", "child:child"]);
+        const recoveryLog: Array<string> = [];
+        const recoveryCfg = StackConfig.layer({ root: recoveryRepo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const recoveryLayer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(recoveryCfg),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(recoveryCfg))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo: recoveryRepo,
+              log: recoveryLog,
+              pulls: [pr(3518, "child", "main"), pr(3519, "grandchild", "child")],
+              metas: [metaFor(pr(3518, "child", "main")), metaFor(pr(3519, "grandchild", "child"))],
+              replayBases: new Map([
+                [
+                  3518,
+                  {
+                    kind: "merged-parent",
+                    branch: "root",
+                    currentBase: "main",
+                    head: currentRoot,
+                    historicalHeads: [childFork],
+                    fetchRef: "refs/pull/3517/head",
+                    change: 3517,
+                  },
+                ],
+              ]),
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({
+                    branch: "child",
+                    parent: "main",
+                    anchor: currentRoot,
+                    pr: 3518,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+        const recovery = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const previewError = yield* Effect.flip(stack.sync({ branch: "child" }));
+          const applyError = yield* Effect.flip(stack.sync({ branch: "child", apply: true }));
+          return { previewError, applyError, history: yield* stack.last() };
+        }).pipe(Effect.provide(recoveryLayer));
+
+        for (const error of [recovery.previewError, recovery.applyError]) {
+          expect(String(error)).toContain("replay preflight failed for child");
+          expect(String(error)).toContain("assignment.txt");
+          for (const commit of childCommits) expect(String(error)).toContain(commit);
+        }
+        expect(recovery.history).toContain("no applied mutation recorded");
+        expect(yield* shell(recoveryRepo, "git", ["rev-parse", "child"])).toBe(originalChild);
+        expect(yield* shell(recoveryRepo, "git", ["rev-parse", "origin/child"])).toBe(
+          originalChild,
+        );
+        expect(yield* shell(recoveryRepo, "git", ["branch", "--list", "grandchild"])).toBe("");
+        expect(yield* shell(recoveryRepo, "git", ["rev-parse", "origin/grandchild"])).toBe(
+          originalGrandchild,
+        );
+        expect(recoveryLog).not.toContain("body 3519");
+      }).pipe(Effect.provide(platform)),
+    45_000,
+  );
+
+  it.effect(
     "land replays the System Controls child directly based on the current root anchor",
     () =>
       verifyDirectParentAnchorLanding({
@@ -6615,6 +6872,33 @@ describe("Stack", () => {
 
       yield* stack.undo(true);
       expect(test.seen).toContain("edit 5 stack-a");
+    }).pipe(Effect.provide(test.layer));
+  });
+
+  it.effect("land records every completed mutation when replay fails after the root merge", () => {
+    const test = makeLand([], "stack-a", null, {
+      preflightReplay: () => Effect.void,
+      replay: (branch, parent) =>
+        Effect.fail(new ReplayConflictError(branch, parent, ["conflict.txt"], "conflict")),
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const error = yield* Effect.flip(stack.land("stack-a", { apply: true, repairDepth: 1 }));
+      const history = yield* stack.last();
+
+      expect(String(error)).toContain("stack-b could not be replayed onto dev");
+      expect(String(error)).toContain("conflict.txt");
+      expect(history.join("\n")).toContain("backup stack-a -> backup/landed-");
+      expect(history).toContain("retarget #5 to dev");
+      expect(history).toContain("merge #4 (stack-a)");
+      expect(history).toContain("drop local stack-a");
+      expect(history.join("\n")).toContain("backup stack-b -> backup/stack-sync-");
+      expect(history).not.toContain("rebase stack-b onto dev");
+      expect(history).not.toContain("push stack-b");
+      expect(test.seen).toContain("merge 4");
+      expect(test.seen).toContain("drop stack-a");
+      expect(test.seen).not.toContain("push stack-b origin");
     }).pipe(Effect.provide(test.layer));
   });
 
@@ -7605,7 +7889,7 @@ describe("Stack", () => {
     }).pipe(Effect.provide(platform)),
   );
 
-  it.effect("sync explains failed replay and keeps backup and undo journal", () =>
+  it.effect("sync preflights a failed replay without creating backup or undo state", () =>
     Effect.gen(function* () {
       const scenario = yield* realStack({
         base: [{ file: "conflict.txt", body: "base\n", message: "base" }],
@@ -7637,10 +7921,9 @@ describe("Stack", () => {
           Effect.catch((err) =>
             Effect.sync(() => {
               failed = true;
-              expect(String(err)).toContain("✕ stack-c #3 failed to rebase onto stack-b");
-              expect(String(err)).toContain("stack-c could not be replayed onto stack-b");
-              expect(String(err)).toContain("stack undo --apply");
-              expect(String(err)).toContain("stack sync");
+              expect(String(err)).toContain("replay preflight failed for stack-c onto stack-b");
+              expect(String(err)).toContain("conflict.txt");
+              expect(String(err)).toContain("No replay or push was performed");
             }),
           ),
         );
@@ -7655,8 +7938,8 @@ describe("Stack", () => {
       ]);
 
       expect(result.failed).toBe(true);
-      expect(result.undo).not.toBeNull();
-      expect(backups).toContain("stack-c");
+      expect(result.undo).toBeNull();
+      expect(backups).not.toContain("stack-c");
     }).pipe(Effect.provide(platform)),
   );
 

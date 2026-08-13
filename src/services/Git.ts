@@ -52,6 +52,12 @@ export interface Interface {
     branch: string,
     commits: ReadonlyArray<string>,
   ) => Effect.Effect<ReadonlyArray<string>, ExecError>;
+  readonly squashBase: (parent: string, branch: string) => Effect.Effect<string, ExecError>;
+  readonly preflightReplay: (
+    branch: string,
+    parent: string,
+    commits: ReadonlyArray<string>,
+  ) => Effect.Effect<void, ExecError | ReplayConflictError>;
   readonly replay: (
     branch: string,
     parent: string,
@@ -303,11 +309,63 @@ export const live = Layer.effect(
         }),
       );
     });
-    const unmergedPaths = Effect.fn("Git.unmergedPaths")(() =>
-      run("git", ["diff", "--name-only", "--diff-filter=U"], [0, 1]).pipe(
+    const unmergedPathsAt = Effect.fn("Git.unmergedPathsAt")((root: string) =>
+      runAt(root, "git", ["diff", "--name-only", "--diff-filter=U"], [0, 1]).pipe(
         Effect.map((out) => out.split("\n").filter(Boolean)),
       ),
     );
+    const unmergedPaths = Effect.fn("Git.unmergedPaths")(() => unmergedPathsAt(cfg.root));
+    const squashBase = Effect.fn("Git.squashBase")(function* (parent: string, branch: string) {
+      const tree = yield* run("git", [
+        "merge-tree",
+        "--write-tree",
+        "--no-messages",
+        parent,
+        branch,
+      ]);
+      return yield* run("git", [
+        "commit-tree",
+        tree,
+        "-p",
+        parent,
+        "-m",
+        `stack replay preflight for ${branch}`,
+      ]);
+    });
+    const cherryPickAt = Effect.fn("Git.cherryPickAt")(function* (
+      root: string,
+      branch: string,
+      parent: string,
+      commits: ReadonlyArray<string>,
+    ) {
+      if (commits.length === 0) return;
+      yield* runAt(root, "git", ["cherry-pick", "--empty=drop", ...commits]).pipe(
+        Effect.asVoid,
+        Effect.catchTag("ExecError", (err) =>
+          Effect.gen(function* () {
+            const paths = yield* unmergedPathsAt(root).pipe(
+              Effect.catch(() => Effect.succeed([] as ReadonlyArray<string>)),
+            );
+            return yield* Effect.fail(new ReplayConflictError(branch, parent, paths, err.stderr));
+          }),
+        ),
+      );
+    });
+    const preflightReplay = Effect.fn("Git.preflightReplay")(function* (
+      branch: string,
+      parent: string,
+      commits: ReadonlyArray<string>,
+    ) {
+      const now = yield* Clock.currentTimeMillis;
+      const worktree = `${cfg.root}/.stack-preflight-${now}-${branch.replaceAll("/", "-")}`;
+      const removeWorktree = run(
+        "git",
+        ["worktree", "remove", "--force", worktree],
+        [0, 1, 128],
+      ).pipe(Effect.asVoid, Effect.orDie);
+      yield* run("git", ["worktree", "add", "--detach", worktree, parent]).pipe(Effect.asVoid);
+      yield* cherryPickAt(worktree, branch, parent, commits).pipe(Effect.ensuring(removeWorktree));
+    });
     const replay = Effect.fn("Git.replay")(function* (
       branch: string,
       parent: string,
@@ -336,21 +394,7 @@ export const live = Layer.effect(
 
       yield* Effect.gen(function* () {
         yield* runAt(root, "git", ["checkout", "-B", temp, parent]).pipe(Effect.asVoid);
-        if (commits.length > 0) {
-          yield* runAt(root, "git", ["cherry-pick", "--empty=drop", ...commits]).pipe(
-            Effect.asVoid,
-            Effect.catchTag("ExecError", (err) =>
-              Effect.gen(function* () {
-                const paths = yield* unmergedPaths().pipe(
-                  Effect.catch(() => Effect.succeed([] as ReadonlyArray<string>)),
-                );
-                return yield* Effect.fail(
-                  new ReplayConflictError(branch, parent, paths, err.stderr),
-                );
-              }),
-            ),
-          );
-        }
+        yield* cherryPickAt(root, branch, parent, commits);
         if (owner) {
           yield* runAt(root, "git", ["checkout", branch]).pipe(Effect.asVoid);
           yield* runAt(root, "git", ["reset", "--hard", temp]).pipe(Effect.asVoid);
@@ -437,6 +481,8 @@ export const live = Layer.effect(
       mergeParents,
       semanticCommits,
       novel,
+      squashBase,
+      preflightReplay,
       replay,
       unmergedPaths,
       release,
@@ -483,6 +529,8 @@ export const test = (opts: {
       semanticCommits: (_anchor, _parent, _branch) =>
         Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
       novel: (_parent, _branch, commits) => Effect.succeed(commits),
+      squashBase: (parent) => Effect.succeed(parent),
+      preflightReplay: () => Effect.void,
       replay: () => Effect.void,
       unmergedPaths: () => Effect.succeed([] as ReadonlyArray<string>),
       release: () => Effect.void,
