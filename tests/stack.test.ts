@@ -93,6 +93,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     mergeParents: () => Effect.succeed([]),
     parents: () => Effect.succeed([]),
     patch: () => Effect.succeed(""),
+    patchId: () => Effect.succeed(""),
     semanticCommits: () => Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
     novel: (_parent, _branch, commits) => Effect.succeed(commits),
     squashBase: (parent) => Effect.succeed(parent),
@@ -937,6 +938,220 @@ const verifyPreservationRootHistoricalChildLanding = (opts?: {
     expect(log).not.toContain("body 3813");
   });
 
+const verifyHostedPreservationWithAppendedRootLanding = (opts?: {
+  readonly failure?: "ambiguous-composition" | "moved-hosted-head" | "patch-drift";
+}) =>
+  Effect.gen(function* () {
+    const root = yield* tempDir();
+    const origin = join(root, "origin.git");
+    const author = join(root, "author");
+    const repo = join(root, "fresh");
+    const log: Array<string> = [];
+    const lines = Array.from({ length: 12 }, (_, index) => `export_${index}`).join("\n");
+
+    yield* shell(root, "git", ["init", "--bare", origin]);
+    yield* mkdirp(author);
+    yield* shell(author, "git", ["init", "-b", "main"]);
+    yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(author, "git", ["remote", "add", "origin", origin]);
+    yield* commitFile(author, "exports.ts", `${lines}\n`, "base");
+    const childAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+    yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "lower-root"]);
+    yield* commitFile(author, "document-view.ts", "semantic view\n", "semantic document views");
+    const lowerRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["checkout", "-b", "historical-root"]);
+    yield* put(join(author, "exports.ts"), `${lines}\nsemantic_email_view\n`);
+    yield* shell(author, "git", ["add", "exports.ts"]);
+    yield* shell(author, "git", ["commit", "-m", "use semantic email views"]);
+    const historicalRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "child"]);
+    const childSubjects = [
+      "add semantic document downloads",
+      "batch semantic document download loading",
+    ];
+    for (const [index, subject] of childSubjects.entries()) {
+      yield* commitFile(author, `download-${index}.ts`, `${subject}\n`, subject);
+    }
+    const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+    yield* shell(author, "git", ["checkout", "-b", "descendant"]);
+    yield* commitFile(author, "bulk-download.ts", "deeper\n", "migrate bulk document downloads");
+    const originalDescendant = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "descendant"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "old-trunk", lowerRoot]);
+    yield* put(join(author, "exports.ts"), `old_context\n${lines}\n`);
+    yield* shell(author, "git", ["add", "exports.ts"]);
+    yield* shell(author, "git", ["commit", "-m", "advance old trunk context"]);
+    const oldTrunk = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    let extraParent: string | null = null;
+    if (opts?.failure === "ambiguous-composition") {
+      yield* shell(author, "git", ["checkout", "-b", "other-parent", lowerRoot]);
+      yield* commitFile(author, "other.ts", "other\n", "other hosted parent");
+      extraParent = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    }
+    yield* shell(author, "git", ["checkout", "historical-root"]);
+    yield* shell(author, "git", [
+      "merge",
+      "--no-ff",
+      oldTrunk,
+      ...(extraParent ? [extraParent] : []),
+      "-m",
+      "preserve semantic email views",
+    ]);
+    const preservationHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    const preservationParents = yield* shell(author, "git", [
+      "show",
+      "-s",
+      "--format=%P",
+      preservationHead,
+    ]);
+    expect(preservationParents.split(" ")[0]).toBe(historicalRoot);
+    expect(preservationParents.split(" ")[1]).toBe(oldTrunk);
+    yield* shell(author, "git", ["push", "origin", `${preservationHead}:refs/pull/3602/history`]);
+
+    yield* shell(author, "git", ["checkout", "main"]);
+    yield* put(join(author, "exports.ts"), `new_context_a\nnew_context_b\n${lines}\n`);
+    yield* put(join(author, "document-view.ts"), "semantic view\n");
+    yield* shell(author, "git", ["add", "exports.ts", "document-view.ts"]);
+    yield* shell(author, "git", ["commit", "-m", "merge semantic document views"]);
+    const repairedBoundary = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "origin", "main"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "root"]);
+    yield* shell(author, "git", ["cherry-pick", "-m", "2", preservationHead]);
+    if (opts?.failure === "patch-drift") {
+      yield* put(join(author, "exports.ts"), `new_context_a\nnew_context_b\n${lines}\ndrifted\n`);
+      yield* shell(author, "git", ["add", "exports.ts"]);
+      yield* shell(author, "git", ["commit", "--amend", "--no-edit"]);
+    }
+    const repairedSemanticHead = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* commitFile(author, "eml-refresh.ts", "refresh\n", "preserve EML view refresh behavior");
+    yield* commitFile(
+      author,
+      "renderer.test.ts",
+      "mock\n",
+      "update email renderer document view mock",
+    );
+    const currentRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+    const oldPatch = yield* shell(author, "git", ["diff", oldTrunk, preservationHead]);
+    const repairedPatch = yield* shell(author, "git", [
+      "diff",
+      repairedBoundary,
+      repairedSemanticHead,
+    ]);
+    expect(oldPatch).not.toBe(repairedPatch);
+
+    yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+    yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+    if (opts?.failure === "moved-hosted-head") {
+      yield* shell(author, "git", ["checkout", "root"]);
+      yield* commitFile(author, "late-root.ts", "moved\n", "late hosted root move");
+      yield* shell(author, "git", ["push", "origin", "root"]);
+    }
+
+    const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+      Layer.provide(NodeServices.layer),
+    );
+    const layer = Stack.layer.pipe(
+      Layer.provideMerge(Progress.noop),
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Proc.live),
+      Layer.provideMerge(cfgLayer),
+      Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+      Layer.provideMerge(
+        integrationGitHub({
+          repo,
+          log,
+          pulls: [pr(3602, "root", "main"), pr(3603, "child", "root")],
+          metas: [metaFor(pr(3602, "root", "main")), metaFor(pr(3603, "child", "root"))],
+          replayBases: new Map([
+            [
+              3602,
+              {
+                kind: "force-push-boundary",
+                currentBase: "main",
+                before: preservationHead,
+                semanticHead: repairedSemanticHead,
+                boundary: repairedBoundary,
+              },
+            ],
+          ]),
+        }),
+      ),
+      Layer.provideMerge(
+        Store.memory(
+          new StackState({
+            version: 1,
+            links: [
+              stackLink({ branch: "root", parent: "main", anchor: repairedBoundary, pr: 3602 }),
+              stackLink({ branch: "child", parent: "root", anchor: childAnchor, pr: 3603 }),
+            ],
+          }),
+        ),
+      ),
+    );
+
+    const operation = Effect.gen(function* () {
+      const stack = yield* Stack;
+      const preview = yield* stack.land("root", { repairDepth: 1 });
+      const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+      return { preview, applied, history: yield* stack.last() };
+    }).pipe(Effect.provide(layer));
+
+    if (opts?.failure) {
+      const error = yield* Effect.flip(operation);
+      const expected = {
+        "ambiguous-composition": "expected at most two parents",
+        "moved-hosted-head": "remote head",
+        "patch-drift": "semantic patches differ",
+      }[opts.failure];
+      expect(String(error)).toContain(expected);
+      expect(yield* shell(repo, "git", ["rev-parse", "child"])).toBe(originalChild);
+      expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(
+        originalDescendant,
+      );
+      return;
+    }
+
+    const result = yield* operation;
+    const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+    const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+    const replayedSubjects = yield* shell(repo, "git", [
+      "log",
+      "--reverse",
+      "--first-parent",
+      "--no-merges",
+      "--format=%s",
+      `${mainHead}..${childHead}`,
+    ]);
+    expect(result.preview.join("\n")).toContain("would merge #3602 (root)");
+    expect(result.preview.join("\n")).toContain("would rebase child onto main");
+    expect(result.preview.join("\n")).not.toContain("descendant");
+    expect(result.applied.join("\n")).toContain("next root: child");
+    expect(result.applied.join("\n")).not.toContain("descendant");
+    expect(replayedSubjects.split("\n")).toEqual(childSubjects);
+    expect(replayedSubjects).not.toContain("semantic document views");
+    expect(replayedSubjects).not.toContain("use semantic email views");
+    expect(replayedSubjects).not.toContain("preserve EML view refresh behavior");
+    expect(replayedSubjects).not.toContain("update email renderer document view mock");
+    expect(result.history).toContain("rebase child onto main");
+    expect(result.history).toContain("push child");
+    expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+    expect(yield* shell(repo, "git", ["branch", "--list", "descendant"])).toBe("");
+    expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(originalDescendant);
+    expect(currentRoot).not.toBe(repairedSemanticHead);
+    expect(log).not.toContain("body 3604");
+  });
+
 const verifyPromotedPreservationParentLanding = (opts: {
   readonly childNumber: number;
   readonly childSubjects: ReadonlyArray<string>;
@@ -1306,6 +1521,59 @@ describe("Git", () => {
       );
 
       expect(remotes).toEqual([{ name: "origin", url: "git@github.com:fork/repo.git" }]);
+    }).pipe(Effect.provide(platform)),
+  );
+
+  it.effect("compares semantic patches across unrelated context shifts", () =>
+    Effect.gen(function* () {
+      const root = yield* tempDir();
+      const repo = join(root, "repo");
+      const lines = Array.from({ length: 12 }, (_, index) => `line_${index}`).join("\n");
+
+      yield* mkdirp(repo);
+      yield* shell(repo, "git", ["init", "-b", "main"]);
+      yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+      yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+      yield* commitFile(repo, "exports.ts", `${lines}\n`, "base");
+
+      yield* shell(repo, "git", ["checkout", "-b", "old-base"]);
+      yield* put(join(repo, "exports.ts"), `old_context\n${lines}\n`);
+      yield* shell(repo, "git", ["add", "exports.ts"]);
+      yield* shell(repo, "git", ["commit", "-m", "old context"]);
+      yield* shell(repo, "git", ["checkout", "-b", "old-head"]);
+      yield* put(join(repo, "exports.ts"), `old_context\n${lines}\nsemantic_export\n`);
+      yield* shell(repo, "git", ["add", "exports.ts"]);
+      yield* shell(repo, "git", ["commit", "-m", "semantic patch"]);
+
+      yield* shell(repo, "git", ["checkout", "-b", "new-base", "main"]);
+      yield* put(join(repo, "exports.ts"), `new_context_a\nnew_context_b\n${lines}\n`);
+      yield* shell(repo, "git", ["add", "exports.ts"]);
+      yield* shell(repo, "git", ["commit", "-m", "new context"]);
+      yield* shell(repo, "git", ["checkout", "-b", "new-head"]);
+      yield* put(
+        join(repo, "exports.ts"),
+        `new_context_a\nnew_context_b\n${lines}\nsemantic_export\n`,
+      );
+      yield* shell(repo, "git", ["add", "exports.ts"]);
+      yield* shell(repo, "git", ["commit", "-m", "semantic patch"]);
+
+      const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+        Layer.provide(NodeServices.layer),
+      );
+      const result = yield* Effect.gen(function* () {
+        const git = yield* Git.Service;
+        const [oldPatch, newPatch, oldPatchId, newPatchId] = yield* Effect.all([
+          git.patch("old-base", "old-head"),
+          git.patch("new-base", "new-head"),
+          git.patchId("old-base", "old-head"),
+          git.patchId("new-base", "new-head"),
+        ]);
+        return { oldPatch, newPatch, oldPatchId, newPatchId };
+      }).pipe(Effect.provide(Git.live.pipe(Layer.provide(cfgLayer))));
+
+      expect(result.oldPatch).not.toBe(result.newPatch);
+      expect(result.oldPatchId).not.toBe("");
+      expect(result.oldPatchId).toBe(result.newPatchId);
     }).pipe(Effect.provide(platform)),
   );
 });
@@ -7068,6 +7336,25 @@ describe("Stack", () => {
       () =>
         verifyPreservationRootHistoricalChildLanding({ failure }).pipe(Effect.provide(platform)),
       60_000,
+    );
+  }
+
+  it.effect(
+    "lands a historical child after a hosted preservation repair and root append fixes",
+    () => verifyHostedPreservationWithAppendedRootLanding().pipe(Effect.provide(platform)),
+    40_000,
+  );
+
+  for (const [failure, label] of [
+    ["patch-drift", "hosted preservation semantic patch drift"],
+    ["moved-hosted-head", "a moved hosted preservation root"],
+    ["ambiguous-composition", "ambiguous hosted preservation parent composition"],
+  ] as const) {
+    it.effect(
+      `fails closed for ${label}`,
+      () =>
+        verifyHostedPreservationWithAppendedRootLanding({ failure }).pipe(Effect.provide(platform)),
+      40_000,
     );
   }
 

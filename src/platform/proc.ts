@@ -12,6 +12,7 @@ export interface Interface {
     tool: string,
     args: ReadonlyArray<string>,
     ok?: ReadonlyArray<number>,
+    input?: string,
   ) => Effect.Effect<string, ExecError>;
 }
 
@@ -34,9 +35,11 @@ export const live = Layer.effect(
       tool: string,
       args: ReadonlyArray<string>,
       ok: ReadonlyArray<number> = [0],
+      input?: string,
     ) {
       const cmd = ChildProcess.make(tool, [...args], {
         cwd,
+        ...(input === undefined ? {} : { stdin: Stream.make(new TextEncoder().encode(input)) }),
         stdout: "pipe",
         stderr: "pipe",
       });

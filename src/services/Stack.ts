@@ -1124,14 +1124,33 @@ ${note}`;
                         );
                       }
                       if (beforeParents.length === 2) {
-                        const [preservedPatch, repairedPatch] = yield* Effect.all([
-                          git.patch(beforeParents[1]!, before),
-                          git.patch(boundary, semanticHead),
+                        const [preservedPatchId, repairedPatchId] = yield* Effect.all([
+                          git.patchId(beforeParents[1]!, before),
+                          git.patchId(boundary, semanticHead),
                         ]);
-                        if (preservedPatch !== repairedPatch) {
+                        if (preservedPatchId !== repairedPatchId) {
                           return yield* Effect.fail(
                             new StackOperationError(
                               `cannot verify hosted preservation repair ${before} -> ${semanticHead} for ${branch}: semantic patches differ`,
+                            ),
+                          );
+                        }
+                        const parentRemote = yield* headRemote(
+                          persistedParent.headRepository ?? null,
+                          Number(persistedParent.pr),
+                        );
+                        const remoteParentHead = yield* git.remoteHead(
+                          parentRemote,
+                          String(link.parent),
+                        );
+                        if (
+                          savedParentHead === null ||
+                          Option.isNone(remoteParentHead) ||
+                          remoteParentHead.value !== savedParentHead
+                        ) {
+                          return yield* Effect.fail(
+                            new StackOperationError(
+                              `hosted preservation parent remote head diverged for ${link.parent}; expected ${savedParentHead}`,
                             ),
                           );
                         }
