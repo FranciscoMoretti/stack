@@ -86,6 +86,7 @@ class ForcePushHistory extends Schema.Class<ForcePushHistory>("ForcePushHistory"
       Schema.Struct({
         pullRequest: Schema.NullOr(
           Schema.Struct({
+            headRefOid: Schema.optional(Schema.String),
             timelineItems: Schema.Struct({
               nodes: Schema.Array(Schema.NullOr(HeadRefForcePushedEvent)),
             }),
@@ -273,7 +274,7 @@ export const layer = Layer.effect(
       }
 
       const forcePushQuery =
-        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(last:100,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt beforeCommit{oid parents(first:2){nodes{oid}}} afterCommit{oid parents(first:2){nodes{oid}}}}}}}}}";
+        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid timelineItems(last:100,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt beforeCommit{oid parents(first:2){nodes{oid}}} afterCommit{oid parents(first:2){nodes{oid}}}}}}}}}";
       const forcePushArgs = [
         "api",
         "graphql",
@@ -361,6 +362,14 @@ export const layer = Layer.effect(
           return leftDistance - rightDistance || right.number - left.number;
         })[0];
       if (!parent) {
+        const currentHead = forcePushHistory.data.repository?.pullRequest?.headRefOid;
+        if (
+          latestForcePush &&
+          latestForcePush.createdAt < event.createdAt &&
+          latestForcePush.afterCommit?.oid === currentHead
+        ) {
+          return yield* forcePushReplay();
+        }
         return yield* Effect.fail(new CodeHostReplayBaseNotFoundError(pr, event.previousRefName));
       }
 

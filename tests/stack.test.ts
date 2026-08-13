@@ -2092,6 +2092,171 @@ describe("GitHub", () => {
     );
   });
 
+  it.effect(
+    "recovers the immediately preceding force-push boundary when the previous base is still open",
+    () => {
+      const proc = Layer.succeed(
+        Proc.Service,
+        Proc.Service.of({
+          exec: (_cwd, _tool, args) =>
+            Effect.sync(() => {
+              if (args[0] === "repo") {
+                return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
+              }
+              if (args.some((arg) => arg.includes("HEAD_REF_FORCE_PUSHED_EVENT"))) {
+                return JSON.stringify({
+                  data: {
+                    repository: {
+                      pullRequest: {
+                        headRefOid: "33809035c73f9220478c21b38cbc9c77dd34592e",
+                        timelineItems: {
+                          nodes: [
+                            {
+                              createdAt: "2026-08-12T13:38:59Z",
+                              beforeCommit: {
+                                oid: "efe5691a581464c7a3af9727a56fe3ab6035785a",
+                                parents: {
+                                  nodes: [{ oid: "98cced5f44ec5554df9b064a571dde16493e68d7" }],
+                                },
+                              },
+                              afterCommit: {
+                                oid: "91fb9acf159c2a5b4ecb44093ffd9ca4ef9f9cc2",
+                                parents: {
+                                  nodes: [{ oid: "98cced5f44ec5554df9b064a571dde16493e68d7" }],
+                                },
+                              },
+                            },
+                            {
+                              createdAt: "2026-08-12T15:05:00Z",
+                              beforeCommit: {
+                                oid: "91fb9acf159c2a5b4ecb44093ffd9ca4ef9f9cc2",
+                                parents: {
+                                  nodes: [{ oid: "98cced5f44ec5554df9b064a571dde16493e68d7" }],
+                                },
+                              },
+                              afterCommit: {
+                                oid: "33809035c73f9220478c21b38cbc9c77dd34592e",
+                                parents: {
+                                  nodes: [{ oid: "3dc21adcfb8fc85cab6e8a18b91ac17cba0b3031" }],
+                                },
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                });
+              }
+              if (args.some((arg) => arg.includes("BASE_REF_CHANGED_EVENT"))) {
+                return JSON.stringify({
+                  data: {
+                    repository: {
+                      pullRequest: {
+                        timelineItems: {
+                          nodes: [
+                            {
+                              createdAt: "2026-08-12T15:05:20Z",
+                              previousRefName:
+                                "francisco/rest-compliance-22a3-migrate-bulk-document-downloads",
+                              currentRefName: "main",
+                            },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                });
+              }
+              return JSON.stringify([]);
+            }),
+        }),
+      );
+
+      return Effect.gen(function* () {
+        const github = yield* CodeHost.Service;
+        const replayBase = yield* github.replayBase(3813, "main");
+
+        expect(Option.getOrUndefined(replayBase)).toEqual({
+          kind: "force-push-boundary",
+          currentBase: "main",
+          before: "91fb9acf159c2a5b4ecb44093ffd9ca4ef9f9cc2",
+          semanticHead: "33809035c73f9220478c21b38cbc9c77dd34592e",
+          boundary: "3dc21adcfb8fc85cab6e8a18b91ac17cba0b3031",
+        });
+      }).pipe(
+        Effect.provide(
+          CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc)),
+        ),
+      );
+    },
+  );
+
+  it.effect("fails closed when an unmerged previous base has no current force-push head", () => {
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, _tool, args) =>
+          Effect.sync(() => {
+            if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
+            if (args.some((arg) => arg.includes("HEAD_REF_FORCE_PUSHED_EVENT"))) {
+              return JSON.stringify({
+                data: {
+                  repository: {
+                    pullRequest: {
+                      headRefOid: "current-head",
+                      timelineItems: {
+                        nodes: [
+                          {
+                            createdAt: "2026-08-12T15:05:00Z",
+                            beforeCommit: { oid: "before", parents: { nodes: [] } },
+                            afterCommit: {
+                              oid: "stale-head",
+                              parents: { nodes: [{ oid: "boundary" }] },
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              });
+            }
+            if (args.some((arg) => arg.includes("BASE_REF_CHANGED_EVENT"))) {
+              return JSON.stringify({
+                data: {
+                  repository: {
+                    pullRequest: {
+                      timelineItems: {
+                        nodes: [
+                          {
+                            createdAt: "2026-08-12T15:05:20Z",
+                            previousRefName: "unmerged-parent",
+                            currentRefName: "main",
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              });
+            }
+            return JSON.stringify([]);
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const error = yield* Effect.flip(github.replayBase(3813, "main"));
+
+      expect(String(error)).toContain("cannot recover the merged change");
+      expect(String(error)).toContain("unmerged-parent");
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
   it.effect("prefers a later parent force push over an earlier base change", () => {
     const proc = Layer.succeed(
       Proc.Service,
@@ -5659,6 +5824,156 @@ describe("Stack", () => {
           "REST Compliance 15A.4: Update task OpenAPI snapshot",
           "Allow converged agent assignment updates",
         ],
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
+  it.effect(
+    "lands the OnlyOffice root retargeted from an open historical base in a fresh clone",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* tempDir();
+        const origin = join(root, "origin.git");
+        const author = join(root, "author");
+        const repo = join(root, "fresh");
+        const log: Array<string> = [];
+
+        yield* shell(root, "git", ["init", "--bare", origin]);
+        yield* mkdirp(author);
+        yield* shell(author, "git", ["init", "-b", "main"]);
+        yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(author, "git", ["remote", "add", "origin", origin]);
+        yield* commitFile(author, "base.txt", "base\n", "base");
+        const persistedRootAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+        yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "historical-base"]);
+        yield* commitFile(
+          author,
+          "bulk-downloads.txt",
+          "bulk downloads\n",
+          "REST Compliance 22A.3: migrate bulk document downloads",
+        );
+        yield* shell(author, "git", ["push", "-u", "origin", "historical-base"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "root"]);
+        yield* commitFile(author, "old-root.txt", "old\n", "old OnlyOffice operation");
+        const preRewriteRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+        yield* shell(author, "git", ["checkout", "main"]);
+        yield* shell(author, "git", ["checkout", "-B", "root"]);
+        yield* commitFile(
+          author,
+          "promotion-operation.txt",
+          "operation\n",
+          "refactor(api): add onlyoffice promotion operation",
+        );
+        const rewrittenRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "--force", "-u", "origin", "root"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "child"]);
+        const childSubject = "refactor(api): normalize onlyoffice promotion contract";
+        yield* commitFile(author, "promotion-contract.txt", "contract\n", childSubject);
+        const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+
+        yield* shell(author, "git", ["checkout", "-b", "grandchild"]);
+        yield* commitFile(author, "consumer.txt", "consumer\n", "migrate promotion consumer");
+        const originalGrandchild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+        yield* shell(author, "git", ["push", "-u", "origin", "grandchild"]);
+
+        yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+        yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+        yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+        yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+
+        const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const layer = Stack.layer.pipe(
+          Layer.provideMerge(Progress.noop),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Proc.live),
+          Layer.provideMerge(cfgLayer),
+          Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+          Layer.provideMerge(
+            integrationGitHub({
+              repo,
+              log,
+              pulls: [pr(3813, "root", "main"), pr(3814, "child", "root")],
+              metas: [metaFor(pr(3813, "root", "main")), metaFor(pr(3814, "child", "root"))],
+              replayBases: new Map([
+                [
+                  3813,
+                  {
+                    kind: "force-push-boundary",
+                    currentBase: "main",
+                    before: preRewriteRoot,
+                    semanticHead: rewrittenRoot,
+                    boundary: persistedRootAnchor,
+                  },
+                ],
+              ]),
+            }),
+          ),
+          Layer.provideMerge(
+            Store.memory(
+              new StackState({
+                version: 1,
+                links: [
+                  stackLink({
+                    branch: "root",
+                    parent: "main",
+                    anchor: persistedRootAnchor,
+                    pr: 3813,
+                  }),
+                  stackLink({
+                    branch: "child",
+                    parent: "root",
+                    anchor: rewrittenRoot,
+                    pr: 3814,
+                  }),
+                ],
+              }),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const stack = yield* Stack;
+          const preview = yield* stack.land("root", { repairDepth: 1 });
+          const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+          return { preview, applied };
+        }).pipe(Effect.provide(layer));
+
+        const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+        const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+        const replayed = yield* shell(repo, "git", [
+          "log",
+          "--reverse",
+          "--first-parent",
+          "--no-merges",
+          "--format=%s",
+          `${mainHead}..${childHead}`,
+        ]);
+
+        expect(result.preview.join("\n")).toContain("would merge #3813 (root)");
+        expect(result.preview.join("\n")).toContain("would rebase child onto main");
+        expect(result.preview.join("\n")).not.toContain("grandchild");
+        expect(result.applied.join("\n")).toContain("next root: child");
+        expect(result.applied.join("\n")).not.toContain("grandchild");
+        expect(replayed.split("\n")).toEqual([childSubject]);
+        expect(replayed).not.toContain("bulk document downloads");
+        expect(replayed).not.toContain("onlyoffice promotion operation");
+        expect(childHead).not.toBe(originalChild);
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+        expect(yield* shell(repo, "git", ["branch", "--list", "grandchild"])).toBe("");
+        expect(yield* shell(repo, "git", ["rev-parse", "origin/grandchild"])).toBe(
+          originalGrandchild,
+        );
+        expect(log).not.toContain("body 3815");
       }).pipe(Effect.provide(platform)),
     20_000,
   );
