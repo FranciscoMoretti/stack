@@ -990,9 +990,9 @@ ${note}`;
               let selected = all;
               let matchedParentPrefix = 0;
               let savedParentBoundaryVerified = false;
+              const persistedParent = savedParent ? links.get(String(link.parent)) : undefined;
 
               if (savedParent) {
-                const persistedParent = links.get(String(link.parent));
                 if (persistedParent?.pr) {
                   const recoveredParent = yield* codeHost.replayBase(
                     Number(persistedParent.pr),
@@ -1035,7 +1035,30 @@ ${note}`;
 
               for (const candidate of candidates) {
                 const candidateHead = yield* git.head(candidate);
-                if (Option.isNone(candidateHead) || candidateHead.value === anchor) continue;
+                if (Option.isNone(candidateHead)) continue;
+                if (candidateHead.value === anchor) {
+                  if (
+                    candidate === savedParent &&
+                    savedParentHead === anchor &&
+                    persistedParent?.pr
+                  ) {
+                    const parentRemote = yield* headRemote(
+                      persistedParent.headRepository ?? null,
+                      Number(persistedParent.pr),
+                    );
+                    const [embeddedParent, remoteParentHead] = yield* Effect.all([
+                      git.base(branch, candidate),
+                      git.remoteHead(parentRemote, String(link.parent)),
+                    ]);
+                    savedParentBoundaryVerified =
+                      Option.isSome(embeddedParent) &&
+                      embeddedParent.value === anchor &&
+                      Option.isSome(remoteParentHead) &&
+                      remoteParentHead.value === anchor;
+                    if (savedParentBoundaryVerified) break;
+                  }
+                  continue;
+                }
                 const [embeddedAnchor, embeddedCandidate] = yield* Effect.all([
                   git.base(candidate, anchor),
                   git.base(branch, candidate),

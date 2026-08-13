@@ -591,6 +591,171 @@ const promotedTriggerFixture = (root: string, rootMerged: boolean) =>
     };
   });
 
+const verifyDirectParentAnchorLanding = (opts: {
+  readonly childSubjects: ReadonlyArray<string>;
+  readonly preservationMerge: boolean;
+  readonly remoteParentMoves?: boolean;
+  readonly rootSubjects: ReadonlyArray<string>;
+}) =>
+  Effect.gen(function* () {
+    const root = yield* tempDir();
+    const origin = join(root, "origin.git");
+    const author = join(root, "author");
+    const repo = join(root, "fresh");
+    const log: Array<string> = [];
+
+    yield* shell(root, "git", ["init", "--bare", origin]);
+    yield* mkdirp(author);
+    yield* shell(author, "git", ["init", "-b", "main"]);
+    yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(author, "git", ["remote", "add", "origin", origin]);
+    yield* commitFile(author, "base.txt", "base\n", "base");
+    const base = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+    yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "root"]);
+    for (const [index, subject] of opts.rootSubjects.entries()) {
+      yield* commitFile(author, `root-${index}.txt`, `${subject}\n`, subject);
+    }
+
+    const childCommits: Array<string> = [];
+    if (opts.preservationMerge) {
+      yield* shell(author, "git", ["checkout", "-b", "child"]);
+      for (const [index, subject] of opts.childSubjects.slice(0, -1).entries()) {
+        yield* commitFile(author, `child-${index}.txt`, `${subject}\n`, subject);
+        childCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+      }
+      yield* shell(author, "git", ["checkout", "root"]);
+      yield* commitFile(author, "root-review.txt", "root review\n", "root-only review fix");
+      yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+      yield* shell(author, "git", ["checkout", "child"]);
+      yield* shell(author, "git", ["merge", "--no-ff", "root", "-m", "merge current parent"]);
+      const finalSubject = opts.childSubjects.at(-1)!;
+      yield* commitFile(author, "child-review.txt", `${finalSubject}\n`, finalSubject);
+      childCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+    } else {
+      yield* shell(author, "git", ["push", "-u", "origin", "root"]);
+      yield* shell(author, "git", ["checkout", "-b", "child"]);
+      for (const [index, subject] of opts.childSubjects.entries()) {
+        yield* commitFile(author, `child-${index}.txt`, `${subject}\n`, subject);
+        childCommits.push(yield* shell(author, "git", ["rev-parse", "HEAD"]));
+      }
+    }
+    const currentRoot = yield* shell(author, "git", ["rev-parse", "root"]);
+    const originalChild = yield* shell(author, "git", ["rev-parse", "child"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+    yield* shell(author, "git", ["checkout", "-b", "descendant"]);
+    yield* commitFile(author, "descendant.txt", "deeper\n", "deeper untouched layer");
+    const originalDescendant = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "descendant"]);
+
+    yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+    yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+    if (opts.remoteParentMoves) {
+      yield* shell(author, "git", ["checkout", "root"]);
+      yield* commitFile(author, "late-root.txt", "moved\n", "late unobserved parent move");
+      yield* shell(author, "git", ["push", "origin", "root"]);
+    }
+
+    const cfgLayer = StackConfig.layer({ root: repo, trunks: ["main"] }).pipe(
+      Layer.provide(NodeServices.layer),
+    );
+    const layer = Stack.layer.pipe(
+      Layer.provideMerge(Progress.noop),
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Proc.live),
+      Layer.provideMerge(cfgLayer),
+      Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+      Layer.provideMerge(
+        integrationGitHub({
+          repo,
+          log,
+          pulls: [
+            pr(3517, "root", "main"),
+            pr(3518, "child", "root"),
+            pr(3519, "descendant", "child"),
+          ],
+          metas: [
+            metaFor(pr(3517, "root", "main")),
+            metaFor(pr(3518, "child", "root")),
+            metaFor(pr(3519, "descendant", "child")),
+          ],
+        }),
+      ),
+      Layer.provideMerge(
+        Store.memory(
+          new StackState({
+            version: 1,
+            links: [
+              stackLink({ branch: "root", parent: "main", anchor: base, pr: 3517 }),
+              stackLink({ branch: "child", parent: "root", anchor: currentRoot, pr: 3518 }),
+              stackLink({
+                branch: "descendant",
+                parent: "child",
+                anchor: originalChild,
+                pr: 3519,
+              }),
+            ],
+          }),
+        ),
+      ),
+    );
+
+    const operation = Effect.gen(function* () {
+      const stack = yield* Stack;
+      const preview = yield* stack.land("root", { repairDepth: 1 });
+      const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+      return { preview, applied };
+    }).pipe(Effect.provide(layer));
+    if (opts.remoteParentMoves) {
+      const error = yield* Effect.flip(operation);
+      expect(String(error)).toContain("semantic replay boundary required for child");
+      expect(yield* shell(repo, "git", ["rev-parse", "child"])).toBe(originalChild);
+      expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(originalChild);
+      expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(
+        originalDescendant,
+      );
+      return;
+    }
+    const result = yield* operation;
+    const mainHead = yield* shell(repo, "git", ["rev-parse", "main"]);
+    const childHead = yield* shell(repo, "git", ["rev-parse", "child"]);
+    const replayedCommits = yield* shell(repo, "git", [
+      "rev-list",
+      "--reverse",
+      "--first-parent",
+      "--no-merges",
+      `${mainHead}..${childHead}`,
+    ]);
+    const replayedSubjects = yield* shell(repo, "git", [
+      "log",
+      "--reverse",
+      "--first-parent",
+      "--no-merges",
+      "--format=%s",
+      `${mainHead}..${childHead}`,
+    ]);
+
+    expect(result.preview.join("\n")).toContain("would merge #3517 (root)");
+    expect(result.preview.join("\n")).toContain("would rebase child onto main");
+    expect(result.preview.join("\n")).not.toContain("descendant");
+    expect(result.applied.join("\n")).toContain("next root: child");
+    expect(result.applied.join("\n")).not.toContain("descendant");
+    expect(replayedSubjects.split("\n")).toEqual(opts.childSubjects);
+    expect(replayedCommits.split("\n")).toHaveLength(childCommits.length);
+    for (const subject of [...opts.rootSubjects, "root-only review fix"]) {
+      expect(replayedSubjects).not.toContain(subject);
+    }
+    expect(yield* shell(repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+    expect(yield* shell(repo, "git", ["branch", "--list", "descendant"])).toBe("");
+    expect(yield* shell(repo, "git", ["rev-parse", "origin/descendant"])).toBe(originalDescendant);
+    expect(log).not.toContain("body 3519");
+  });
+
 const cfg = StackConfig.layer({ root: "/tmp/stack", trunks: ["dev"] }).pipe(
   Layer.provide(NodeServices.layer),
 );
@@ -5477,6 +5642,54 @@ describe("Stack", () => {
         );
         expect(originalRoot).not.toBe(mainHead);
         expect(log).not.toContain("body 3519");
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
+  it.effect(
+    "land replays the Tasks child whose preservation merge embeds the current root anchor",
+    () =>
+      verifyDirectParentAnchorLanding({
+        preservationMerge: true,
+        rootSubjects: ["REST Compliance 15A.3: Consolidate task assignment"],
+        childSubjects: [
+          "REST Compliance 15A.4: Add canonical task state PATCH",
+          "REST Compliance 15A.4: Update task OpenAPI snapshot",
+          "Allow converged agent assignment updates",
+        ],
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
+  it.effect(
+    "land replays the System Controls child directly based on the current root anchor",
+    () =>
+      verifyDirectParentAnchorLanding({
+        preservationMerge: false,
+        rootSubjects: [
+          "refactor(api): move system-control orchestration into service",
+          "feat(api): add system-controls desired-state resource",
+          "fix(core-api): prevent partial system-control updates",
+          "REST Compliance 24A.2: Update system-controls OpenAPI snapshot",
+        ],
+        childSubjects: [
+          "refactor(dashboard): canonicalize system-control integration",
+          "fix(dashboard): refresh controls from maintenance events",
+          "test(dashboard): pin system-control subscriptions",
+          "style(dashboard): format system-control test",
+        ],
+      }).pipe(Effect.provide(platform)),
+    20_000,
+  );
+
+  it.effect(
+    "land fails closed when the remote parent moved beyond the persisted direct anchor",
+    () =>
+      verifyDirectParentAnchorLanding({
+        preservationMerge: false,
+        remoteParentMoves: true,
+        rootSubjects: ["root semantic layer"],
+        childSubjects: ["first child layer", "second child layer"],
       }).pipe(Effect.provide(platform)),
     20_000,
   );
