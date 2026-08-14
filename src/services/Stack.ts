@@ -1216,9 +1216,133 @@ ${note}`;
                           git.patchId(beforeParents[0]!, before),
                           git.patchId(boundary, semanticHead),
                         ]);
-                        candidates.push(before);
+                        let historicalBoundary = before;
+                        let generatedSuffixVerified = false;
+                        if (historicalPatchId !== repairedPatchId) {
+                          const reviewedHead = beforeParents[0]!;
+                          const reviewedParents = yield* git.parents(reviewedHead);
+                          if (reviewedParents.length === 1) {
+                            const [reviewedPatchId, omittedPaths, repairedPaths, embeddedReviewed] =
+                              yield* Effect.all([
+                                git.patchId(reviewedParents[0]!, reviewedHead),
+                                git.changedPaths(reviewedHead, before),
+                                git.changedPaths(boundary, semanticHead),
+                                git.base(branch, reviewedHead),
+                              ]);
+                            if (
+                              reviewedPatchId === repairedPatchId &&
+                              omittedPaths.length > 0 &&
+                              Option.isSome(embeddedReviewed) &&
+                              embeddedReviewed.value === reviewedHead
+                            ) {
+                              const repairedPathSet = new Set(repairedPaths);
+                              if (omittedPaths.some((path) => repairedPathSet.has(path))) {
+                                return yield* Effect.fail(
+                                  new StackOperationError(
+                                    `cannot verify generated-suffix parent rewrite ${before} -> ${semanticHead} for ${branch}: generated composition drifted in the promoted parent`,
+                                  ),
+                                );
+                              }
+                              const ownership = yield* Effect.forEach(
+                                omittedPaths,
+                                (path) =>
+                                  Effect.all([
+                                    git.attribute(reviewedHead, path, "linguist-generated"),
+                                    git.attribute(boundary, path, "linguist-generated"),
+                                    git.attribute(semanticHead, path, "linguist-generated"),
+                                  ]).pipe(
+                                    Effect.map((values) =>
+                                      values.every(
+                                        (value) => Option.isSome(value) && value.value === "true",
+                                      ),
+                                    ),
+                                  ),
+                                { concurrency: "unbounded" },
+                              );
+                              if (ownership.some((owned) => !owned)) {
+                                return yield* Effect.fail(
+                                  new StackOperationError(
+                                    `cannot verify generated ownership for omitted parent suffix ${reviewedHead} -> ${before} on ${branch}`,
+                                  ),
+                                );
+                              }
+                              const superseded = yield* Effect.forEach(
+                                omittedPaths,
+                                (path) =>
+                                  Effect.all([
+                                    git.blob(before, path),
+                                    git.blob(boundary, path),
+                                  ]).pipe(
+                                    Effect.map(
+                                      ([obsolete, current]) =>
+                                        Option.getOrNull(obsolete) !== Option.getOrNull(current),
+                                    ),
+                                  ),
+                                { concurrency: "unbounded" },
+                              );
+                              if (superseded.some((value) => !value)) {
+                                return yield* Effect.fail(
+                                  new StackOperationError(
+                                    `cannot verify generated suffix ${reviewedHead} -> ${before} was superseded by trunk ${boundary} for ${branch}`,
+                                  ),
+                                );
+                              }
+                              const [hostedRoot, remoteTrunk] = yield* Effect.all([
+                                codeHost.changeBoundary(Number(persistedParent.pr)),
+                                git.remoteHead("origin", String(persistedParent.parent)),
+                              ]);
+                              const fetchedTrunk = Option.isSome(remoteTrunk)
+                                ? yield* git.fetchRef(`refs/heads/${persistedParent.parent}`).pipe(
+                                    Effect.map(Option.some),
+                                    Effect.catchTag("ExecError", () =>
+                                      Effect.succeed(Option.none<string>()),
+                                    ),
+                                  )
+                                : Option.none<string>();
+                              const [hostedBaseContainsBoundary, trunkContainsHostedBase] =
+                                Option.isSome(hostedRoot) && Option.isSome(fetchedTrunk)
+                                  ? yield* Effect.all([
+                                      git.base(hostedRoot.value.base, boundary),
+                                      git.base(fetchedTrunk.value, hostedRoot.value.base),
+                                    ])
+                                  : [Option.none<string>(), Option.none<string>()];
+                              if (
+                                Option.isNone(hostedRoot) ||
+                                hostedRoot.value.head !== semanticHead ||
+                                Option.isNone(remoteTrunk) ||
+                                Option.isNone(fetchedTrunk) ||
+                                fetchedTrunk.value !== remoteTrunk.value ||
+                                Option.isNone(hostedBaseContainsBoundary) ||
+                                hostedBaseContainsBoundary.value !== boundary ||
+                                Option.isNone(trunkContainsHostedBase) ||
+                                trunkContainsHostedBase.value !== hostedRoot.value.base
+                              ) {
+                                return yield* Effect.fail(
+                                  new StackOperationError(
+                                    `hosted replay boundary diverged for ${branch}; refusing generated parent rewrite from ${before}`,
+                                  ),
+                                );
+                              }
+                              const generatedProof = yield* codeHost.generatedArtifactsProof(
+                                Number(persistedParent.pr),
+                                semanticHead,
+                              );
+                              if (Option.isNone(generatedProof)) {
+                                return yield* Effect.fail(
+                                  new StackOperationError(
+                                    `cannot verify deterministic generated output at ${semanticHead} for ${branch}`,
+                                  ),
+                                );
+                              }
+                              historicalBoundary = reviewedHead;
+                              generatedSuffixVerified = true;
+                            }
+                          }
+                        }
+                        candidates.push(historicalBoundary);
                         recoveredParentRewrite = recoveredParent.value;
-                        recoveredParentRewritePatchVerified = historicalPatchId === repairedPatchId;
+                        recoveredParentRewritePatchVerified =
+                          historicalPatchId === repairedPatchId || generatedSuffixVerified;
                       }
                     }
                   }

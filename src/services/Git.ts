@@ -45,6 +45,16 @@ export interface Interface {
   readonly parents: (commit: string) => Effect.Effect<ReadonlyArray<string>, ExecError>;
   readonly patch: (base: string, head: string) => Effect.Effect<string, ExecError>;
   readonly patchId: (base: string, head: string) => Effect.Effect<string, ExecError>;
+  readonly changedPaths: (
+    base: string,
+    head: string,
+  ) => Effect.Effect<ReadonlyArray<string>, ExecError>;
+  readonly attribute: (
+    source: string,
+    path: string,
+    name: string,
+  ) => Effect.Effect<Option.Option<string>, ExecError>;
+  readonly blob: (source: string, path: string) => Effect.Effect<Option.Option<string>, ExecError>;
   readonly semanticCommits: (
     anchor: string,
     parent: string,
@@ -277,6 +287,27 @@ export const live = Layer.effect(
         .exec(cfg.root, "git", ["patch-id", "--stable"], [0], diff)
         .pipe(Effect.map((out) => out.split(/\s+/, 1)[0] ?? ""));
     });
+    const changedPaths = Effect.fn("Git.changedPaths")((base: string, head: string) =>
+      run("git", ["diff", "--name-only", "-z", base, head]).pipe(
+        Effect.map((out) => out.split("\0").filter(Boolean)),
+      ),
+    );
+    const attribute = Effect.fn("Git.attribute")((source: string, path: string, name: string) =>
+      run("git", ["check-attr", "-z", `--source=${source}`, name, "--", path]).pipe(
+        Effect.map((out) => {
+          const fields = out.split("\0");
+          const value = fields[2];
+          return value && value !== "unspecified" && value !== "unset"
+            ? Option.some(value)
+            : Option.none<string>();
+        }),
+      ),
+    );
+    const blob = Effect.fn("Git.blob")((source: string, path: string) =>
+      run("git", ["rev-parse", "--verify", `${source}:${path}`], [0, 1, 128]).pipe(
+        Effect.map((out) => (out ? Option.some(out) : Option.none<string>())),
+      ),
+    );
     const semanticCommits = Effect.fn("Git.semanticCommits")(function* (
       anchor: string,
       parent: string,
@@ -511,6 +542,9 @@ export const live = Layer.effect(
       parents,
       patch,
       patchId,
+      changedPaths,
+      attribute,
+      blob,
       semanticCommits,
       novel,
       squashBase,
@@ -561,6 +595,9 @@ export const test = (opts: {
       parents: () => Effect.succeed([]),
       patch: () => Effect.succeed(""),
       patchId: () => Effect.succeed(""),
+      changedPaths: () => Effect.succeed([]),
+      attribute: () => Effect.succeed(Option.none()),
+      blob: () => Effect.succeed(Option.none()),
       semanticCommits: (_anchor, _parent, _branch) =>
         Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
       novel: (_parent, _branch, commits) => Effect.succeed(commits),

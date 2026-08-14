@@ -22,6 +22,7 @@ export interface Options {
   readonly log?: Array<string>;
   readonly replayBases?: ReadonlyMap<number, CodeHost.ReplayBase>;
   readonly changeBoundaries?: ReadonlyMap<number, CodeHost.ChangeBoundary>;
+  readonly generatedArtifactsProofs?: ReadonlyMap<number, CodeHost.GeneratedArtifactsProof>;
 }
 
 export const layer = (opts: Options) =>
@@ -80,6 +81,17 @@ export const layer = (opts: Options) =>
       const changeBoundary = Effect.fn("CodeHost.memory.changeBoundary")((pr: number) => {
         const value = opts.changeBoundaries?.get(pr);
         return Effect.succeed(value ? Option.some(value) : Option.none<CodeHost.ChangeBoundary>());
+      });
+      const generatedArtifactsProof = Effect.fn("CodeHost.memory.generatedArtifactsProof")((
+        pr: number,
+        head: string,
+      ) => {
+        const value = opts.generatedArtifactsProofs?.get(pr);
+        return Effect.succeed(
+          value?.head === head
+            ? Option.some(value)
+            : Option.none<CodeHost.GeneratedArtifactsProof>(),
+        );
       });
       const edit = Effect.fn("CodeHost.memory.edit")((pr: number, base: string) =>
         Effect.gen(function* () {
@@ -228,6 +240,7 @@ export const layer = (opts: Options) =>
         changes,
         change,
         changeBoundary,
+        generatedArtifactsProof,
         replayBase,
         edit,
         body,

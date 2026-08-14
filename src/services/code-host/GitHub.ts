@@ -102,6 +102,33 @@ class ForcePushHistory extends Schema.Class<ForcePushHistory>("ForcePushHistory"
   }),
 }) {}
 
+class CheckRun extends Schema.Class<CheckRun>("CheckRun")({
+  name: Schema.String,
+  head_sha: Schema.String,
+  status: Schema.String,
+  conclusion: Schema.NullOr(Schema.String),
+  details_url: Schema.NullOr(Schema.String),
+  app: Schema.NullOr(Schema.Struct({ slug: Schema.String })),
+}) {}
+
+class CheckRuns extends Schema.Class<CheckRuns>("CheckRuns")({
+  check_runs: Schema.Array(CheckRun),
+}) {}
+
+class ActionJobStep extends Schema.Class<ActionJobStep>("ActionJobStep")({
+  name: Schema.String,
+  status: Schema.String,
+  conclusion: Schema.NullOr(Schema.String),
+}) {}
+
+class ActionJob extends Schema.Class<ActionJob>("ActionJob")({
+  name: Schema.String,
+  head_sha: Schema.String,
+  status: Schema.String,
+  conclusion: Schema.NullOr(Schema.String),
+  steps: Schema.Array(ActionJobStep),
+}) {}
+
 class MergedPull extends Schema.Class<MergedPull>("MergedPull")({
   number: Schema.Number,
   headRefName: Schema.String,
@@ -174,6 +201,18 @@ const decodeBaseRefHistory = (args: ReadonlyArray<string>, out: string) =>
 const decodeForcePushHistory = (args: ReadonlyArray<string>, out: string) =>
   Effect.try({
     try: () => Schema.decodeUnknownSync(ForcePushHistory)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodeCheckRuns = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(CheckRuns)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
+const decodeActionJob = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(ActionJob)(JSON.parse(extractJson(out))),
     catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
   });
 
@@ -271,6 +310,57 @@ export const layer = Layer.effect(
         Effect.flatMap((out) => decodePullBoundaryView(args, out)),
         Effect.map((row) => Option.some({ head: row.headRefOid, base: row.baseRefOid })),
       );
+    });
+
+    const generatedArtifactsProof = Effect.fn("CodeHost.github.generatedArtifactsProof")(function* (
+      _pr: number,
+      head: string,
+    ) {
+      const checksArgs = ["api", `repos/{owner}/{repo}/commits/${head}/check-runs?per_page=100`];
+      const checks = yield* run(checksArgs).pipe(
+        Effect.flatMap((out) => decodeCheckRuns(checksArgs, out)),
+      );
+      const candidates = checks.check_runs.filter(
+        (check) =>
+          check.head_sha === head &&
+          check.status === "completed" &&
+          check.conclusion === "success" &&
+          check.details_url !== null &&
+          check.app?.slug === "github-actions" &&
+          /schema|generated|snapshot|client/i.test(check.name),
+      );
+      for (const check of candidates) {
+        const jobId = check.details_url?.match(/\/job\/(\d+)(?:$|[?#])/)?.[1];
+        if (!jobId) continue;
+        const jobArgs = ["api", `repos/{owner}/{repo}/actions/jobs/${jobId}`];
+        const job = yield* run(jobArgs).pipe(
+          Effect.flatMap((out) => decodeActionJob(jobArgs, out)),
+        );
+        if (job.head_sha !== head || job.status !== "completed" || job.conclusion !== "success") {
+          continue;
+        }
+        const generatorIndex = job.steps.findIndex(
+          (step) =>
+            step.status === "completed" &&
+            step.conclusion === "success" &&
+            /\bgenerat(?:e|es|ed|ing|ion)\b/i.test(step.name),
+        );
+        const cleanlinessIndex = job.steps.findIndex(
+          (step, index) =>
+            index > generatorIndex &&
+            step.status === "completed" &&
+            step.conclusion === "success" &&
+            /uncommitted changes|working tree|git (?:diff|status)/i.test(step.name),
+        );
+        if (generatorIndex === -1 || cleanlinessIndex === -1) continue;
+        return Option.some({
+          head,
+          check: check.name,
+          generatorStep: job.steps[generatorIndex]!.name,
+          cleanlinessStep: job.steps[cleanlinessIndex]!.name,
+        });
+      }
+      return Option.none<CodeHost.GeneratedArtifactsProof>();
     });
 
     const replayBase = Effect.fn("CodeHost.github.replayBase")(function* (
@@ -513,6 +603,7 @@ export const layer = Layer.effect(
       changes,
       change,
       changeBoundary,
+      generatedArtifactsProof,
       replayBase,
       edit,
       body,

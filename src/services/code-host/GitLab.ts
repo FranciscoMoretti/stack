@@ -186,6 +186,9 @@ export const layer = Layer.effect(
     const changeBoundary = Effect.fn("CodeHost.gitlab.changeBoundary")(() =>
       Effect.succeed(Option.none<CodeHost.ChangeBoundary>()),
     );
+    const generatedArtifactsProof = Effect.fn("CodeHost.gitlab.generatedArtifactsProof")(() =>
+      Effect.succeed(Option.none<CodeHost.GeneratedArtifactsProof>()),
+    );
 
     const auto = Effect.fn("CodeHost.gitlab.auto")((pr: number) =>
       run([
@@ -295,6 +298,7 @@ export const layer = Layer.effect(
       changes,
       change,
       changeBoundary,
+      generatedArtifactsProof,
       replayBase,
       edit,
       body,

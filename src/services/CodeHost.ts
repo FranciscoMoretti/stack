@@ -34,6 +34,13 @@ export interface ChangeBoundary {
   readonly base: string;
 }
 
+export interface GeneratedArtifactsProof {
+  readonly head: string;
+  readonly check: string;
+  readonly generatorStep: string;
+  readonly cleanlinessStep: string;
+}
+
 export interface Interface {
   readonly provider: Provider;
   readonly capabilities: Capabilities;
@@ -52,6 +59,10 @@ export interface Interface {
   readonly changeBoundary: (
     number: number,
   ) => Effect.Effect<Option.Option<ChangeBoundary>, CodeHostError>;
+  readonly generatedArtifactsProof: (
+    number: number,
+    head: string,
+  ) => Effect.Effect<Option.Option<GeneratedArtifactsProof>, CodeHostError>;
   readonly replayBase: (
     number: number,
     currentBase: string,

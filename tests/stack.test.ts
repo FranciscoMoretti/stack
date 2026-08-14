@@ -94,6 +94,9 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     parents: () => Effect.succeed([]),
     patch: () => Effect.succeed(""),
     patchId: () => Effect.succeed(""),
+    changedPaths: () => Effect.succeed([]),
+    attribute: () => Effect.succeed(Option.none()),
+    blob: () => Effect.succeed(Option.none()),
     semanticCommits: () => Effect.succeed({ commits: [], matchedParentPrefix: 0 }),
     novel: (_parent, _branch, commits) => Effect.succeed(commits),
     squashBase: (parent) => Effect.succeed(parent),
@@ -119,6 +122,7 @@ const gitAndCodeHost = (service: Partial<Git.Interface & CodeHost.Interface>) =>
     changes: () => Effect.succeed([]),
     change: (number) => Effect.fail(new CodeHostChangeNotFoundError(number)),
     changeBoundary: () => Effect.succeed(Option.none()),
+    generatedArtifactsProof: () => Effect.succeed(Option.none()),
     replayBase: () => Effect.succeed(Option.none()),
     edit: () => Effect.void,
     body: () => Effect.void,
@@ -225,6 +229,7 @@ const integrationGitHub = (opts: {
   readonly log: Array<string>;
   readonly replayBases?: ReadonlyMap<number, CodeHost.ReplayBase>;
   readonly changeBoundaries?: ReadonlyMap<number, CodeHost.ChangeBoundary>;
+  readonly generatedArtifactsProofs?: ReadonlyMap<number, CodeHost.GeneratedArtifactsProof>;
 }) =>
   Layer.effect(
     CodeHost.Service,
@@ -357,6 +362,14 @@ const integrationGitHub = (opts: {
         changeBoundary: (pr) => {
           const value = opts.changeBoundaries?.get(pr);
           return Effect.succeed(value ? Option.some(value) : Option.none());
+        },
+        generatedArtifactsProof: (pr, head) => {
+          const value = opts.generatedArtifactsProofs?.get(pr);
+          return Effect.succeed(
+            value?.head === head
+              ? Option.some(value)
+              : Option.none<CodeHost.GeneratedArtifactsProof>(),
+          );
         },
         replayBase: (pr, currentBase) => {
           const value = opts.replayBases?.get(pr);
@@ -609,7 +622,13 @@ const promotedLintFixture = (
     readonly childBranch?: string;
     readonly childReviewFix?: boolean;
     readonly descendantBranch?: string;
-    readonly fixtureKind?: "batch" | "lint";
+    readonly fixtureKind?: "batch" | "generated" | "lint";
+    readonly generatedFailure?:
+      | "ambiguous"
+      | "composition-drift"
+      | "not-superseded"
+      | "unowned"
+      | "unrelated";
     readonly patchDrift?: boolean;
     readonly preservationRewrite?: boolean;
     readonly rootBranch?: string;
@@ -624,6 +643,7 @@ const promotedLintFixture = (
     const childBranch = opts?.childBranch ?? "child";
     const descendantBranch = opts?.descendantBranch ?? "descendant";
     const batchFixture = opts?.fixtureKind === "batch";
+    const generatedFixture = opts?.fixtureKind === "generated";
 
     yield* shell(root, "git", ["init", "--bare", origin]);
     yield* mkdirp(author);
@@ -631,7 +651,20 @@ const promotedLintFixture = (
     yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
     yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
     yield* shell(author, "git", ["remote", "add", "origin", origin]);
-    yield* commitFile(author, "baseline.txt", "baseline\n", "persisted lint anchor");
+    if (generatedFixture) {
+      yield* mkdirp(join(author, "generated"));
+      yield* put(
+        join(author, ".gitattributes"),
+        opts?.generatedFailure === "unowned"
+          ? "generated/** text\n"
+          : "generated/** linguist-generated=true\n",
+      );
+      yield* put(join(author, "generated/openapi.json"), "historical schema\n");
+      yield* shell(author, "git", ["add", ".gitattributes", "generated/openapi.json"]);
+      yield* shell(author, "git", ["commit", "-m", "persisted lint anchor"]);
+    } else {
+      yield* commitFile(author, "baseline.txt", "baseline\n", "persisted lint anchor");
+    }
     const persistedChildAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
     yield* shell(author, "git", ["push", "-u", "origin", "main"]);
     yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
@@ -639,20 +672,40 @@ const promotedLintFixture = (
     yield* shell(author, "git", ["checkout", "-b", "historical-root"]);
     yield* commitFile(
       author,
-      batchFixture ? "batch-delete-contract.ts" : "export-rule.ts",
-      batchFixture ? "batch delete contract\n" : "export rule\n",
+      batchFixture
+        ? "batch-delete-contract.ts"
+        : generatedFixture
+          ? "prior-rule.ts"
+          : "export-rule.ts",
+      batchFixture
+        ? "batch delete contract\n"
+        : generatedFixture
+          ? "prior rule\n"
+          : "export rule\n",
       batchFixture
         ? "REST Compliance 25C: Add bounded batch-delete contract"
-        : "ALA-3001 Enable Oxlint import/export rule",
+        : generatedFixture
+          ? "ALA-3036 Enable prior lint rule"
+          : "ALA-3001 Enable Oxlint import/export rule",
     );
     const inheritedCommit = yield* shell(author, "git", ["rev-parse", "HEAD"]);
     yield* commitFile(
       author,
-      batchFixture ? "workspace-batch-delete.ts" : "named-rule.ts",
-      batchFixture ? "workspace batch deletion\n" : "named rule\n",
+      batchFixture
+        ? "workspace-batch-delete.ts"
+        : generatedFixture
+          ? "no-map-spread.ts"
+          : "named-rule.ts",
+      batchFixture
+        ? "workspace batch deletion\n"
+        : generatedFixture
+          ? "no map spread\n"
+          : "named rule\n",
       batchFixture
         ? "REST Compliance 25D: Migrate Workspace batch deletion"
-        : "ALA-2999 Enable Oxlint import/named rule",
+        : generatedFixture
+          ? "ALA-3037 Enable no-map-spread"
+          : "ALA-2999 Enable Oxlint import/named rule",
     );
     if (opts?.rootReviewFix) {
       yield* commitFile(
@@ -667,11 +720,21 @@ const promotedLintFixture = (
     yield* shell(author, "git", ["checkout", "-b", childBranch]);
     yield* commitFile(
       author,
-      batchFixture ? "batch-move-contract.ts" : "zero-baseline.ts",
-      batchFixture ? "batch move contract\n" : "zero baseline\n",
+      batchFixture
+        ? "batch-move-contract.ts"
+        : generatedFixture
+          ? "promise-executor.ts"
+          : "zero-baseline.ts",
+      batchFixture
+        ? "batch move contract\n"
+        : generatedFixture
+          ? "promise executor return\n"
+          : "zero baseline\n",
       batchFixture
         ? "REST Compliance 25E: Add bounded batch-move contract"
-        : "ALA-3000 Enable zero-baseline native Oxlint rules",
+        : generatedFixture
+          ? "ALA-3038 Enable no-promise-executor-return"
+          : "ALA-3000 Enable zero-baseline native Oxlint rules",
     );
     if (opts?.childReviewFix) {
       yield* commitFile(
@@ -691,6 +754,14 @@ const promotedLintFixture = (
     yield* shell(author, "git", ["checkout", "main"]);
     yield* shell(author, "git", ["merge", "--squash", inheritedCommit]);
     yield* shell(author, "git", ["commit", "-m", "merge import export rule"]);
+    if (generatedFixture) {
+      yield* commitFile(
+        author,
+        "generated/openapi.json",
+        "current trunk schema\n",
+        "regenerate current trunk schema",
+      );
+    }
     const rootAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
     let replayBefore = historicalRoot;
     let ambiguousReplayBefore = historicalRoot;
@@ -724,9 +795,50 @@ const promotedLintFixture = (
         `${ambiguousReplayBefore}:refs/heads/ambiguous-preservation-history`,
       ]);
       yield* shell(author, "git", ["checkout", "main"]);
+    } else if (generatedFixture) {
+      yield* shell(author, "git", ["checkout", "historical-root"]);
+      yield* put(
+        join(author, "generated/openapi.json"),
+        opts?.generatedFailure === "not-superseded"
+          ? "current trunk schema\n"
+          : "obsolete generated schema\n",
+      );
+      yield* shell(author, "git", ["add", "generated/openapi.json"]);
+      if (opts?.generatedFailure === "unrelated") {
+        yield* put(join(author, "unrelated.ts"), "unrelated omitted behavior\n");
+        yield* shell(author, "git", ["add", "unrelated.ts"]);
+      }
+      yield* shell(author, "git", ["commit", "-m", "fix: refresh obsolete generated snapshot"]);
+      replayBefore = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+      if (opts?.generatedFailure === "ambiguous") {
+        const replayTree = yield* shell(author, "git", ["rev-parse", `${replayBefore}^{tree}`]);
+        replayBefore = yield* shell(author, "git", [
+          "commit-tree",
+          replayTree,
+          "-p",
+          historicalRoot,
+          "-p",
+          rootAnchor,
+          "-p",
+          persistedChildAnchor,
+          "-m",
+          "ambiguous generated history",
+        ]);
+      }
+      yield* shell(author, "git", [
+        "push",
+        "origin",
+        `${replayBefore}:refs/heads/generated-history`,
+      ]);
+      yield* shell(author, "git", ["checkout", "main"]);
     }
     yield* shell(author, "git", ["checkout", "-b", rootBranch]);
     yield* shell(author, "git", ["cherry-pick", `${inheritedCommit}..${historicalRoot}`]);
+    if (opts?.generatedFailure === "composition-drift") {
+      yield* put(join(author, "generated/openapi.json"), "drifted promoted schema\n");
+      yield* shell(author, "git", ["add", "generated/openapi.json"]);
+      yield* shell(author, "git", ["commit", "--amend", "--no-edit"]);
+    }
     if (opts?.patchDrift) {
       yield* put(join(author, "named-rule.ts"), "drifted named rule\n");
       yield* shell(author, "git", ["add", "named-rule.ts"]);
@@ -771,13 +883,15 @@ const promotedLintFixture = (
             "REST Compliance 25E: Add bounded batch-move contract",
             "Document batch move folder conflicts",
           ]
-        : ["ALA-3000 Enable zero-baseline native Oxlint rules"],
+        : generatedFixture
+          ? ["ALA-3038 Enable no-promise-executor-return"]
+          : ["ALA-3000 Enable zero-baseline native Oxlint rules"],
     };
   });
 
 const verifyPromotedLintLanding = (opts?: {
   readonly advancedTrunk?: boolean;
-  readonly exactFixture?: boolean | "batch";
+  readonly exactFixture?: boolean | "batch" | "generated";
   readonly failure?:
     | "ambiguous-preservation"
     | "identity-mismatch"
@@ -788,11 +902,19 @@ const verifyPromotedLintLanding = (opts?: {
     | "diverged-trunk"
     | "patch-drift"
     | "stale-hosted-lineage"
-    | "stale-trunk-boundary";
+    | "stale-trunk-boundary"
+    | "generated-ambiguous"
+    | "generated-composition-drift"
+    | "generated-proof-missing"
+    | "generated-proof-stale"
+    | "generated-not-superseded"
+    | "generated-unowned"
+    | "generated-unrelated";
 }) =>
   Effect.gen(function* () {
     const root = yield* tempDir();
     const batchFixture = opts?.exactFixture === "batch";
+    const generatedFixture = opts?.exactFixture === "generated";
     const fixture = yield* promotedLintFixture(root, {
       ...(opts?.advancedTrunk ? { advancedTrunk: true } : {}),
       ...(batchFixture
@@ -804,20 +926,50 @@ const verifyPromotedLintLanding = (opts?: {
             preservationRewrite: true,
             rootBranch: "francisco/rest-compliance-25d-workspace-batch-delete",
           }
-        : opts?.exactFixture
+        : generatedFixture
           ? {
-              childBranch: "francisco/ala-3027-warning-comments",
-              descendantBranch: "francisco/ala-3028-next-layer",
-              rootBranch: "francisco/ala-3026-associated-labels",
-              rootReviewFix: true,
+              childBranch: "francisco/ala-3038-no-promise-executor-return",
+              descendantBranch: "francisco/ala-3039-next-layer",
+              fixtureKind: "generated" as const,
+              rootBranch: "francisco/ala-3037-no-map-spread",
             }
-          : {}),
+          : opts?.exactFixture
+            ? {
+                childBranch: "francisco/ala-3027-warning-comments",
+                descendantBranch: "francisco/ala-3028-next-layer",
+                rootBranch: "francisco/ala-3026-associated-labels",
+                rootReviewFix: true,
+              }
+            : {}),
       patchDrift: opts?.failure === "patch-drift",
+      ...(opts?.failure === "generated-ambiguous"
+        ? { generatedFailure: "ambiguous" as const }
+        : opts?.failure === "generated-composition-drift"
+          ? { generatedFailure: "composition-drift" as const }
+          : opts?.failure === "generated-unowned"
+            ? { generatedFailure: "unowned" as const }
+            : opts?.failure === "generated-not-superseded"
+              ? { generatedFailure: "not-superseded" as const }
+              : opts?.failure === "generated-unrelated"
+                ? { generatedFailure: "unrelated" as const }
+                : {}),
     });
     const log: Array<string> = [];
-    const rootPr = batchFixture ? 3896 : opts?.exactFixture ? 3890 : 3886;
-    const childPr = batchFixture ? 3897 : opts?.exactFixture ? 3891 : 3887;
-    const descendantPr = batchFixture ? 3898 : opts?.exactFixture ? 3892 : 3888;
+    const rootPr = batchFixture ? 3896 : generatedFixture ? 3974 : opts?.exactFixture ? 3890 : 3886;
+    const childPr = batchFixture
+      ? 3897
+      : generatedFixture
+        ? 3975
+        : opts?.exactFixture
+          ? 3891
+          : 3887;
+    const descendantPr = batchFixture
+      ? 3898
+      : generatedFixture
+        ? 3976
+        : opts?.exactFixture
+          ? 3892
+          : 3888;
 
     if (opts?.failure === "moved-root") {
       yield* shell(fixture.author, "git", ["checkout", fixture.rootBranch]);
@@ -911,6 +1063,24 @@ const verifyPromotedLintLanding = (opts?: {
                   [childPr, { head: fixture.originalChild, base: fixture.currentRoot }],
                 ]),
               }),
+          ...(generatedFixture && opts?.failure !== "generated-proof-missing"
+            ? {
+                generatedArtifactsProofs: new Map([
+                  [
+                    rootPr,
+                    {
+                      head:
+                        opts?.failure === "generated-proof-stale"
+                          ? fixture.historicalRoot
+                          : fixture.currentRoot,
+                      check: "API Schema Validation / Validate API Schema Compatibility",
+                      generatorStep: "Generate TypeScript client",
+                      cleanlinessStep: "Check for uncommitted changes",
+                    },
+                  ],
+                ]),
+              }
+            : {}),
         }),
       ),
       Layer.provideMerge(
@@ -955,6 +1125,13 @@ const verifyPromotedLintLanding = (opts?: {
         "patch-drift": "semantic patches differ",
         "stale-hosted-lineage": "hosted replay boundary diverged",
         "stale-trunk-boundary": "hosted replay boundary diverged",
+        "generated-ambiguous": "expected at most two parents",
+        "generated-composition-drift": "semantic patches differ",
+        "generated-proof-missing": "cannot verify deterministic generated output",
+        "generated-proof-stale": "cannot verify deterministic generated output",
+        "generated-not-superseded": "was superseded by trunk",
+        "generated-unowned": "cannot verify generated ownership",
+        "generated-unrelated": "cannot verify generated ownership",
       }[opts.failure];
       expect(String(error)).toContain(expected);
       expect(yield* shell(fixture.repo, "git", ["rev-parse", fixture.childBranch])).toBe(
@@ -3199,6 +3376,128 @@ describe("Git", () => {
 });
 
 describe("GitHub", () => {
+  it.effect("proves generated artifacts from an exact-head generation and cleanliness job", () => {
+    const head = "72528822149093dab6ca1ac31fd3a5b7057d1eba";
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            expect(tool).toBe("gh");
+            calls.push(args);
+            if (String(args[1]).includes("check-runs")) {
+              return JSON.stringify({
+                check_runs: [
+                  {
+                    name: "API Schema Validation / Validate API Schema Compatibility",
+                    head_sha: head,
+                    status: "completed",
+                    conclusion: "success",
+                    details_url: "https://github.com/alaro-ai/alaro/actions/runs/1/job/94761754442",
+                    app: { slug: "github-actions" },
+                  },
+                ],
+              });
+            }
+            return JSON.stringify({
+              name: "API Schema Validation / Validate API Schema Compatibility",
+              head_sha: head,
+              status: "completed",
+              conclusion: "success",
+              steps: [
+                { name: "Checkout repository", status: "completed", conclusion: "success" },
+                {
+                  name: "Generate TypeScript client",
+                  status: "completed",
+                  conclusion: "success",
+                },
+                {
+                  name: "Check for uncommitted changes",
+                  status: "completed",
+                  conclusion: "success",
+                },
+              ],
+            });
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const proof = yield* github.generatedArtifactsProof(3974, head);
+      expect(Option.getOrUndefined(proof)).toEqual({
+        head,
+        check: "API Schema Validation / Validate API Schema Compatibility",
+        generatorStep: "Generate TypeScript client",
+        cleanlinessStep: "Check for uncommitted changes",
+      });
+      expect(calls).toEqual([
+        ["api", `repos/{owner}/{repo}/commits/${head}/check-runs?per_page=100`],
+        ["api", "repos/{owner}/{repo}/actions/jobs/94761754442"],
+      ]);
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  for (const [label, checkHead, generatorConclusion, cleanlinessConclusion] of [
+    ["stale check head", "stale-head", "success", "success"],
+    ["failed generation", "exact-head", "failure", "success"],
+    ["non-reproducible generated output", "exact-head", "success", "failure"],
+  ] as const) {
+    it.effect(`rejects ${label} as generated-artifact proof`, () => {
+      const proc = Layer.succeed(
+        Proc.Service,
+        Proc.Service.of({
+          exec: (_cwd, _tool, args) =>
+            Effect.succeed(
+              String(args[1]).includes("check-runs")
+                ? JSON.stringify({
+                    check_runs: [
+                      {
+                        name: "Generated output",
+                        head_sha: checkHead,
+                        status: "completed",
+                        conclusion: "success",
+                        details_url: "https://github.com/example/actions/runs/1/job/2",
+                        app: { slug: "github-actions" },
+                      },
+                    ],
+                  })
+                : JSON.stringify({
+                    name: "Generated output",
+                    head_sha: "exact-head",
+                    status: "completed",
+                    conclusion: "success",
+                    steps: [
+                      {
+                        name: "Generate artifacts",
+                        status: "completed",
+                        conclusion: generatorConclusion,
+                      },
+                      {
+                        name: "Check working tree clean",
+                        status: "completed",
+                        conclusion: cleanlinessConclusion,
+                      },
+                    ],
+                  }),
+            ),
+        }),
+      );
+
+      return Effect.gen(function* () {
+        const github = yield* CodeHost.Service;
+        expect(Option.isNone(yield* github.generatedArtifactsProof(3974, "exact-head"))).toBe(true);
+      }).pipe(
+        Effect.provide(
+          CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc)),
+        ),
+      );
+    });
+  }
+
   it.effect("reads the hosted pull request commit boundary", () => {
     const proc = Layer.succeed(
       Proc.Service,
@@ -8472,6 +8771,39 @@ describe("Stack", () => {
       }).pipe(Effect.provide(platform)),
     30_000,
   );
+
+  it.effect(
+    "lands the promise-executor child after a generated snapshot suffix is superseded on trunk",
+    () => verifyPromotedLintLanding({ exactFixture: "generated" }).pipe(Effect.provide(platform)),
+    30_000,
+  );
+
+  for (const [failure, label] of [
+    ["patch-drift", "non-generated promoted-parent drift"],
+    ["generated-unowned", "an omitted path without generated ownership"],
+    ["generated-proof-missing", "missing generated-output verification"],
+    ["generated-proof-stale", "stale generated-output verification"],
+    ["generated-not-superseded", "generated output not superseded by trunk"],
+    ["missing-hosted-lineage", "missing generated-snapshot hosted lineage"],
+    ["missing-transition", "a missing generated-snapshot transition"],
+    ["stale-hosted-lineage", "stale generated-snapshot hosted lineage"],
+    ["diverged-trunk", "a moved generated-snapshot trunk"],
+    ["moved-root", "a moved generated-snapshot root"],
+    ["moved-child", "a moved generated-snapshot child"],
+    ["identity-mismatch", "generated-snapshot PR identity drift"],
+    ["generated-ambiguous", "ambiguous generated-snapshot parents"],
+    ["generated-composition-drift", "generated-snapshot composition drift"],
+    ["generated-unrelated", "an unrelated omitted suffix hunk"],
+  ] as const) {
+    it.effect(
+      `fails closed for ${label}`,
+      () =>
+        verifyPromotedLintLanding({ exactFixture: "generated", failure }).pipe(
+          Effect.provide(platform),
+        ),
+      30_000,
+    );
+  }
 
   for (const [failure, label] of [
     ["ambiguous-preservation", "ambiguous preservation parents"],
