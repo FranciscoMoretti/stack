@@ -183,6 +183,9 @@ export const layer = Layer.effect(
     const replayBase = Effect.fn("CodeHost.gitlab.replayBase")(() =>
       Effect.succeed(Option.none<CodeHost.ReplayBase>()),
     );
+    const changeBoundary = Effect.fn("CodeHost.gitlab.changeBoundary")(() =>
+      Effect.succeed(Option.none<CodeHost.ChangeBoundary>()),
+    );
 
     const auto = Effect.fn("CodeHost.gitlab.auto")((pr: number) =>
       run([
@@ -291,6 +294,7 @@ export const layer = Layer.effect(
       wait,
       changes,
       change,
+      changeBoundary,
       replayBase,
       edit,
       body,

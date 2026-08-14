@@ -1056,6 +1056,58 @@ ${note}`;
               let matchedParentPrefix = 0;
               let savedParentBoundaryVerified = false;
               const persistedParent = savedParent ? links.get(String(link.parent)) : undefined;
+              const verifyHostedNestedPreservation = Effect.fn(
+                "Stack.repairStack.verifyHostedNestedPreservation",
+              )(function* (head: string, boundary: string, hostedBase: string) {
+                const visited = new Set<string>();
+                let current = head;
+                let expectedSecondParent = hostedBase;
+                for (;;) {
+                  if (visited.has(current)) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `cannot verify hosted preservation lineage ${head} -> ${boundary} for ${branch}: cycle detected`,
+                      ),
+                    );
+                  }
+                  visited.add(current);
+                  const parents = yield* git.parents(current);
+                  if (parents.length !== 2 || parents[1] !== expectedSecondParent) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `cannot verify hosted preservation lineage ${head} -> ${boundary} for ${branch}: expected binary merge ${current} with second parent ${expectedSecondParent}`,
+                      ),
+                    );
+                  }
+                  const firstParent = parents[0]!;
+                  if (firstParent === boundary) return;
+                  const nextParents = yield* git.parents(firstParent);
+                  if (nextParents.length !== 2) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `cannot verify hosted preservation lineage ${head} -> ${boundary} for ${branch}: first-parent chain stopped at ${firstParent}`,
+                      ),
+                    );
+                  }
+                  const historicalTrunk = nextParents[1]!;
+                  const embeddedHistoricalTrunk = yield* git.base(
+                    expectedSecondParent,
+                    historicalTrunk,
+                  );
+                  if (
+                    Option.isNone(embeddedHistoricalTrunk) ||
+                    embeddedHistoricalTrunk.value !== historicalTrunk
+                  ) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `cannot verify hosted preservation lineage ${head} -> ${boundary} for ${branch}: second-parent history diverged at ${historicalTrunk}`,
+                      ),
+                    );
+                  }
+                  current = firstParent;
+                  expectedSecondParent = historicalTrunk;
+                }
+              });
 
               if (savedParent) {
                 if (persistedParent?.pr) {
@@ -1219,6 +1271,68 @@ ${note}`;
                 if (Option.isNone(embeddedAnchor) || embeddedAnchor.value !== anchor) continue;
                 const preservedMergeParents =
                   candidate === savedParent ? yield* git.mergeParents(candidate) : [];
+                if (
+                  candidate === savedParent &&
+                  persistedParent?.pr &&
+                  link.pr &&
+                  savedParentHead !== null &&
+                  Option.isSome(embeddedAnchor) &&
+                  embeddedAnchor.value === anchor &&
+                  Option.isSome(embeddedCandidate) &&
+                  embeddedCandidate.value === anchor
+                ) {
+                  const [parentBoundary, childBoundary, branchHead] = yield* Effect.all([
+                    codeHost.changeBoundary(Number(persistedParent.pr)),
+                    codeHost.changeBoundary(Number(link.pr)),
+                    git.head(branch),
+                  ]);
+                  if (Option.isSome(parentBoundary) && Option.isSome(childBoundary)) {
+                    if (
+                      parentBoundary.value.head !== savedParentHead ||
+                      parentBoundary.value.base !== String(persistedParent.anchor) ||
+                      Option.isNone(branchHead) ||
+                      childBoundary.value.head !== branchHead.value ||
+                      childBoundary.value.base !== anchor
+                    ) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `hosted replay boundary diverged for ${branch}; refusing persisted anchor ${anchor}`,
+                        ),
+                      );
+                    }
+                    yield* verifyHostedNestedPreservation(
+                      savedParentHead,
+                      anchor,
+                      parentBoundary.value.base,
+                    );
+                    const parentRemote = yield* headRemote(
+                      persistedParent.headRepository ?? null,
+                      Number(persistedParent.pr),
+                    );
+                    const childRemote = yield* headRemote(
+                      link.headRepository ?? null,
+                      Number(link.pr),
+                    );
+                    const [remoteParentHead, remoteBranchHead] = yield* Effect.all([
+                      git.remoteHead(parentRemote, String(link.parent)),
+                      git.remoteHead(childRemote, branch),
+                    ]);
+                    if (
+                      Option.isNone(remoteParentHead) ||
+                      remoteParentHead.value !== savedParentHead ||
+                      Option.isNone(remoteBranchHead) ||
+                      remoteBranchHead.value !== branchHead.value
+                    ) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `hosted replay remote head diverged for ${branch}; refusing persisted anchor ${anchor}`,
+                        ),
+                      );
+                    }
+                    savedParentBoundaryVerified = true;
+                    break;
+                  }
+                }
                 if (
                   candidate === savedParent &&
                   persistedParent?.pr &&

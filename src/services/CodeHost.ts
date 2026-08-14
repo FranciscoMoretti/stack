@@ -29,6 +29,11 @@ export interface ReplayMergedParent {
 
 export type ReplayBase = ReplayForcePushBoundary | ReplayMergedParent;
 
+export interface ChangeBoundary {
+  readonly head: string;
+  readonly base: string;
+}
+
 export interface Interface {
   readonly provider: Provider;
   readonly capabilities: Capabilities;
@@ -44,6 +49,9 @@ export interface Interface {
   readonly wait: (pr: number) => Effect.Effect<void, CodeHostError>;
   readonly changes: () => Effect.Effect<ReadonlyArray<PullRef>, CodeHostError>;
   readonly change: (number: number) => Effect.Effect<PullMeta, CodeHostError>;
+  readonly changeBoundary: (
+    number: number,
+  ) => Effect.Effect<Option.Option<ChangeBoundary>, CodeHostError>;
   readonly replayBase: (
     number: number,
     currentBase: string,

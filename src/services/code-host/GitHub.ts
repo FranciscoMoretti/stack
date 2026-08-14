@@ -39,6 +39,11 @@ class PullWatch extends Schema.Class<PullWatch>("PullWatch")({
   mergedAt: Schema.NullOr(Schema.String),
 }) {}
 
+class PullBoundaryView extends Schema.Class<PullBoundaryView>("PullBoundaryView")({
+  headRefOid: Schema.String,
+  baseRefOid: Schema.String,
+}) {}
+
 class RepositoryView extends Schema.Class<RepositoryView>("RepositoryView")({
   nameWithOwner: Schema.String,
 }) {}
@@ -148,6 +153,12 @@ const decodePullWatch = (args: ReadonlyArray<string>, out: string) =>
     catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
   });
 
+const decodePullBoundaryView = (args: ReadonlyArray<string>, out: string) =>
+  Effect.try({
+    try: () => Schema.decodeUnknownSync(PullBoundaryView)(JSON.parse(extractJson(out))),
+    catch: (err) => new CodeHostDecodeError("gh", args, out, String(err)),
+  });
+
 const decodeRepositoryView = (args: ReadonlyArray<string>, out: string) =>
   Effect.try({
     try: () => Schema.decodeUnknownSync(RepositoryView)(JSON.parse(extractJson(out))),
@@ -250,6 +261,15 @@ export const layer = Layer.effect(
         Effect.catchIf(missingPull, () => Effect.fail(new CodeHostChangeNotFoundError(pr))),
         Effect.flatMap((out) => decodePullView(args, out)),
         Effect.map(meta),
+      );
+    });
+
+    const changeBoundary = Effect.fn("CodeHost.github.changeBoundary")((pr: number) => {
+      const args = ["pr", "view", `${pr}`, "--json", "headRefOid,baseRefOid"];
+      return run(args).pipe(
+        Effect.catchIf(missingPull, () => Effect.fail(new CodeHostChangeNotFoundError(pr))),
+        Effect.flatMap((out) => decodePullBoundaryView(args, out)),
+        Effect.map((row) => Option.some({ head: row.headRefOid, base: row.baseRefOid })),
       );
     });
 
@@ -492,6 +512,7 @@ export const layer = Layer.effect(
       wait,
       changes,
       change,
+      changeBoundary,
       replayBase,
       edit,
       body,

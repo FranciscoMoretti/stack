@@ -21,6 +21,7 @@ export interface Options {
   readonly metas?: ReadonlyArray<PullMeta>;
   readonly log?: Array<string>;
   readonly replayBases?: ReadonlyMap<number, CodeHost.ReplayBase>;
+  readonly changeBoundaries?: ReadonlyMap<number, CodeHost.ChangeBoundary>;
 }
 
 export const layer = (opts: Options) =>
@@ -75,6 +76,10 @@ export const layer = (opts: Options) =>
         return Effect.succeed(
           value?.currentBase === currentBase ? Option.some(value) : Option.none(),
         );
+      });
+      const changeBoundary = Effect.fn("CodeHost.memory.changeBoundary")((pr: number) => {
+        const value = opts.changeBoundaries?.get(pr);
+        return Effect.succeed(value ? Option.some(value) : Option.none<CodeHost.ChangeBoundary>());
       });
       const edit = Effect.fn("CodeHost.memory.edit")((pr: number, base: string) =>
         Effect.gen(function* () {
@@ -222,6 +227,7 @@ export const layer = (opts: Options) =>
         wait,
         changes,
         change,
+        changeBoundary,
         replayBase,
         edit,
         body,
