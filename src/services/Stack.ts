@@ -1328,9 +1328,17 @@ ${note}`;
                           git.base(parentBoundary.value.base, String(persistedParent.anchor)),
                           git.remoteHead("origin", String(persistedParent.parent)),
                         ]);
-                      const currentBaseContainsHostedBase = Option.isSome(remoteBase)
+                      const fetchedRemoteBase = Option.isSome(remoteBase)
+                        ? yield* git.fetchRef(`refs/heads/${persistedParent.parent}`).pipe(
+                            Effect.map(Option.some),
+                            Effect.catchTag("ExecError", () =>
+                              Effect.succeed(Option.none<string>()),
+                            ),
+                          )
+                        : Option.none<string>();
+                      const currentBaseContainsHostedBase = Option.isSome(fetchedRemoteBase)
                         ? yield* git
-                            .base(remoteBase.value, parentBoundary.value.base)
+                            .base(fetchedRemoteBase.value, parentBoundary.value.base)
                             .pipe(
                               Effect.catchTag("ExecError", () =>
                                 Effect.succeed(Option.none<string>()),
@@ -1338,13 +1346,16 @@ ${note}`;
                             )
                         : Option.none<string>();
                       parentHostedBaseVerified =
-                        rewriteBoundaryParents.length === 1 &&
-                        rewriteBoundaryParents[0] === String(persistedParent.anchor) &&
+                        (recoveredParentRewrite.boundary === String(persistedParent.anchor) ||
+                          (rewriteBoundaryParents.length === 1 &&
+                            rewriteBoundaryParents[0] === String(persistedParent.anchor))) &&
                         Option.isSome(hostedBaseHead) &&
                         hostedBaseHead.value === parentBoundary.value.base &&
                         Option.isSome(hostedBaseAnchor) &&
                         hostedBaseAnchor.value === String(persistedParent.anchor) &&
                         Option.isSome(remoteBase) &&
+                        Option.isSome(fetchedRemoteBase) &&
+                        fetchedRemoteBase.value === remoteBase.value &&
                         Option.isSome(currentBaseContainsHostedBase) &&
                         currentBaseContainsHostedBase.value === parentBoundary.value.base;
                     }

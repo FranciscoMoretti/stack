@@ -607,8 +607,11 @@ const promotedLintFixture = (
   opts?: {
     readonly advancedTrunk?: boolean;
     readonly childBranch?: string;
+    readonly childReviewFix?: boolean;
     readonly descendantBranch?: string;
+    readonly fixtureKind?: "batch" | "lint";
     readonly patchDrift?: boolean;
+    readonly preservationRewrite?: boolean;
     readonly rootBranch?: string;
     readonly rootReviewFix?: boolean;
   },
@@ -620,6 +623,7 @@ const promotedLintFixture = (
     const rootBranch = opts?.rootBranch ?? "root";
     const childBranch = opts?.childBranch ?? "child";
     const descendantBranch = opts?.descendantBranch ?? "descendant";
+    const batchFixture = opts?.fixtureKind === "batch";
 
     yield* shell(root, "git", ["init", "--bare", origin]);
     yield* mkdirp(author);
@@ -635,16 +639,20 @@ const promotedLintFixture = (
     yield* shell(author, "git", ["checkout", "-b", "historical-root"]);
     yield* commitFile(
       author,
-      "export-rule.ts",
-      "export rule\n",
-      "ALA-3001 Enable Oxlint import/export rule",
+      batchFixture ? "batch-delete-contract.ts" : "export-rule.ts",
+      batchFixture ? "batch delete contract\n" : "export rule\n",
+      batchFixture
+        ? "REST Compliance 25C: Add bounded batch-delete contract"
+        : "ALA-3001 Enable Oxlint import/export rule",
     );
     const inheritedCommit = yield* shell(author, "git", ["rev-parse", "HEAD"]);
     yield* commitFile(
       author,
-      "named-rule.ts",
-      "named rule\n",
-      "ALA-2999 Enable Oxlint import/named rule",
+      batchFixture ? "workspace-batch-delete.ts" : "named-rule.ts",
+      batchFixture ? "workspace batch deletion\n" : "named rule\n",
+      batchFixture
+        ? "REST Compliance 25D: Migrate Workspace batch deletion"
+        : "ALA-2999 Enable Oxlint import/named rule",
     );
     if (opts?.rootReviewFix) {
       yield* commitFile(
@@ -659,10 +667,20 @@ const promotedLintFixture = (
     yield* shell(author, "git", ["checkout", "-b", childBranch]);
     yield* commitFile(
       author,
-      "zero-baseline.ts",
-      "zero baseline\n",
-      "ALA-3000 Enable zero-baseline native Oxlint rules",
+      batchFixture ? "batch-move-contract.ts" : "zero-baseline.ts",
+      batchFixture ? "batch move contract\n" : "zero baseline\n",
+      batchFixture
+        ? "REST Compliance 25E: Add bounded batch-move contract"
+        : "ALA-3000 Enable zero-baseline native Oxlint rules",
     );
+    if (opts?.childReviewFix) {
+      yield* commitFile(
+        author,
+        "batch-move-conflicts.ts",
+        "document folder conflicts\n",
+        "Document batch move folder conflicts",
+      );
+    }
     const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
     yield* shell(author, "git", ["push", "-u", "origin", childBranch]);
     yield* shell(author, "git", ["checkout", "-b", descendantBranch]);
@@ -674,6 +692,39 @@ const promotedLintFixture = (
     yield* shell(author, "git", ["merge", "--squash", inheritedCommit]);
     yield* shell(author, "git", ["commit", "-m", "merge import export rule"]);
     const rootAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    let replayBefore = historicalRoot;
+    let ambiguousReplayBefore = historicalRoot;
+    if (opts?.preservationRewrite) {
+      yield* shell(author, "git", ["checkout", "historical-root"]);
+      yield* shell(author, "git", [
+        "merge",
+        "--no-ff",
+        "main",
+        "-m",
+        "preserve workspace batch deletion migration",
+      ]);
+      replayBefore = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+      yield* shell(author, "git", ["push", "origin", "HEAD:preservation-history"]);
+      const replayTree = yield* shell(author, "git", ["rev-parse", `${replayBefore}^{tree}`]);
+      ambiguousReplayBefore = yield* shell(author, "git", [
+        "commit-tree",
+        replayTree,
+        "-p",
+        historicalRoot,
+        "-p",
+        rootAnchor,
+        "-p",
+        persistedChildAnchor,
+        "-m",
+        "ambiguous preservation history",
+      ]);
+      yield* shell(author, "git", [
+        "push",
+        "origin",
+        `${ambiguousReplayBefore}:refs/heads/ambiguous-preservation-history`,
+      ]);
+      yield* shell(author, "git", ["checkout", "main"]);
+    }
     yield* shell(author, "git", ["checkout", "-b", rootBranch]);
     yield* shell(author, "git", ["cherry-pick", `${inheritedCommit}..${historicalRoot}`]);
     if (opts?.patchDrift) {
@@ -701,6 +752,7 @@ const promotedLintFixture = (
 
     return {
       author,
+      ambiguousReplayBefore,
       childBranch,
       descendantBranch,
       repo,
@@ -712,14 +764,22 @@ const promotedLintFixture = (
       currentMain: yield* shell(repo, "git", ["rev-parse", "main"]),
       originalChild,
       originalDescendant,
+      replayBefore,
       rootBranch,
+      semanticSubjects: batchFixture
+        ? [
+            "REST Compliance 25E: Add bounded batch-move contract",
+            "Document batch move folder conflicts",
+          ]
+        : ["ALA-3000 Enable zero-baseline native Oxlint rules"],
     };
   });
 
 const verifyPromotedLintLanding = (opts?: {
   readonly advancedTrunk?: boolean;
-  readonly exactFixture?: boolean;
+  readonly exactFixture?: boolean | "batch";
   readonly failure?:
+    | "ambiguous-preservation"
     | "identity-mismatch"
     | "missing-hosted-lineage"
     | "missing-transition"
@@ -732,22 +792,32 @@ const verifyPromotedLintLanding = (opts?: {
 }) =>
   Effect.gen(function* () {
     const root = yield* tempDir();
+    const batchFixture = opts?.exactFixture === "batch";
     const fixture = yield* promotedLintFixture(root, {
       ...(opts?.advancedTrunk ? { advancedTrunk: true } : {}),
-      ...(opts?.exactFixture
+      ...(batchFixture
         ? {
-            childBranch: "francisco/ala-3027-warning-comments",
-            descendantBranch: "francisco/ala-3028-next-layer",
-            rootBranch: "francisco/ala-3026-associated-labels",
-            rootReviewFix: true,
+            childBranch: "francisco/rest-compliance-25e-batch-move-contract",
+            childReviewFix: true,
+            descendantBranch: "francisco/rest-compliance-25f-workspace-batch-move",
+            fixtureKind: "batch" as const,
+            preservationRewrite: true,
+            rootBranch: "francisco/rest-compliance-25d-workspace-batch-delete",
           }
-        : {}),
+        : opts?.exactFixture
+          ? {
+              childBranch: "francisco/ala-3027-warning-comments",
+              descendantBranch: "francisco/ala-3028-next-layer",
+              rootBranch: "francisco/ala-3026-associated-labels",
+              rootReviewFix: true,
+            }
+          : {}),
       patchDrift: opts?.failure === "patch-drift",
     });
     const log: Array<string> = [];
-    const rootPr = opts?.exactFixture ? 3890 : 3886;
-    const childPr = opts?.exactFixture ? 3891 : 3887;
-    const descendantPr = opts?.exactFixture ? 3892 : 3888;
+    const rootPr = batchFixture ? 3896 : opts?.exactFixture ? 3890 : 3886;
+    const childPr = batchFixture ? 3897 : opts?.exactFixture ? 3891 : 3887;
+    const descendantPr = batchFixture ? 3898 : opts?.exactFixture ? 3892 : 3888;
 
     if (opts?.failure === "moved-root") {
       yield* shell(fixture.author, "git", ["checkout", fixture.rootBranch]);
@@ -807,9 +877,11 @@ const verifyPromotedLintLanding = (opts?: {
                       kind: "force-push-boundary" as const,
                       currentBase: "main",
                       before:
-                        opts?.failure === "stale-hosted-lineage"
-                          ? fixture.persistedChildAnchor
-                          : fixture.historicalRoot,
+                        opts?.failure === "ambiguous-preservation"
+                          ? fixture.ambiguousReplayBefore
+                          : opts?.failure === "stale-hosted-lineage"
+                            ? fixture.persistedChildAnchor
+                            : fixture.replayBefore,
                       semanticHead: fixture.currentRoot,
                       boundary: fixture.currentRootBoundary,
                     },
@@ -873,6 +945,7 @@ const verifyPromotedLintLanding = (opts?: {
     if (opts?.failure) {
       const error = yield* Effect.flip(operation);
       const expected = {
+        "ambiguous-preservation": "expected at most two parents",
         "identity-mismatch": "hosted change identity diverged",
         "missing-hosted-lineage": "hosted change boundary required",
         "missing-transition": "hosted replay boundary diverged",
@@ -912,7 +985,7 @@ const verifyPromotedLintLanding = (opts?: {
     expect(result.preview.join("\n")).not.toContain(fixture.descendantBranch);
     expect(result.applied.join("\n")).toContain(`next root: ${fixture.childBranch}`);
     expect(result.applied.join("\n")).not.toContain(fixture.descendantBranch);
-    expect(replayedSubjects).toBe("ALA-3000 Enable zero-baseline native Oxlint rules");
+    expect(replayedSubjects.split("\n")).toEqual(fixture.semanticSubjects);
     expect(replayedSubjects).not.toContain("ALA-3001");
     expect(replayedSubjects).not.toContain("ALA-2999");
     expect(result.history).toContain(`rebase ${fixture.childBranch} onto main`);
@@ -8389,6 +8462,40 @@ describe("Stack", () => {
       ),
     30_000,
   );
+
+  it.effect(
+    "lands the batch-move child after a preservation root is promoted from its persisted anchor",
+    () =>
+      verifyPromotedLintLanding({
+        advancedTrunk: true,
+        exactFixture: "batch",
+      }).pipe(Effect.provide(platform)),
+    30_000,
+  );
+
+  for (const [failure, label] of [
+    ["ambiguous-preservation", "ambiguous preservation parents"],
+    ["identity-mismatch", "a mismatched batch-move PR identity"],
+    ["missing-hosted-lineage", "missing batch-move hosted lineage"],
+    ["missing-transition", "a missing batch-move root transition"],
+    ["moved-child", "a moved batch-move child"],
+    ["moved-root", "a moved batch-delete root"],
+    ["diverged-trunk", "a divergent batch-delete trunk"],
+    ["patch-drift", "batch-delete preservation patch drift"],
+    ["stale-hosted-lineage", "stale batch-delete hosted lineage"],
+    ["stale-trunk-boundary", "an unprovable batch-delete anchor divergence"],
+  ] as const) {
+    it.effect(
+      `fails closed for ${label}`,
+      () =>
+        verifyPromotedLintLanding({
+          advancedTrunk: true,
+          exactFixture: "batch",
+          failure,
+        }).pipe(Effect.provide(platform)),
+      30_000,
+    );
+  }
 
   it.effect(
     "fails closed when the hosted PR identity does not match the promoted child branch",
