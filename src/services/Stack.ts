@@ -1291,15 +1291,56 @@ ${note}`;
                   Option.isSome(embeddedCandidate) &&
                   embeddedCandidate.value === anchor
                 ) {
-                  const [parentBoundary, childBoundary, branchHead] = yield* Effect.all([
-                    codeHost.changeBoundary(Number(persistedParent.pr)),
-                    codeHost.changeBoundary(Number(link.pr)),
-                    git.head(branch),
-                  ]);
+                  const [parentBoundary, childBoundary, parentChange, childChange, branchHead] =
+                    yield* Effect.all([
+                      codeHost.changeBoundary(Number(persistedParent.pr)),
+                      codeHost.changeBoundary(Number(link.pr)),
+                      codeHost.change(Number(persistedParent.pr)),
+                      codeHost.change(Number(link.pr)),
+                      git.head(branch),
+                    ]);
                   if (Option.isSome(parentBoundary) && Option.isSome(childBoundary)) {
                     if (
+                      String(parentChange.head) !== String(link.parent) ||
+                      String(parentChange.base) !== String(persistedParent.parent) ||
+                      String(childChange.head) !== branch ||
+                      String(childChange.base) !== String(link.parent)
+                    ) {
+                      return yield* Effect.fail(
+                        new StackOperationError(
+                          `hosted change identity diverged for ${branch}; expected #${link.pr} ${branch} -> ${link.parent}`,
+                        ),
+                      );
+                    }
+                    let parentHostedBaseVerified =
+                      parentBoundary.value.base === String(persistedParent.anchor);
+                    if (
+                      !parentHostedBaseVerified &&
+                      trunk(String(persistedParent.parent)) &&
+                      recoveredParentRewrite !== null &&
+                      recoveredParentRewritePatchVerified &&
+                      recoveredParentRewrite.semanticHead === savedParentHead
+                    ) {
+                      const [rewriteBoundaryParents, hostedBaseHead, hostedBaseAnchor, remoteBase] =
+                        yield* Effect.all([
+                          git.parents(recoveredParentRewrite.boundary),
+                          git.head(parentBoundary.value.base),
+                          git.base(parentBoundary.value.base, String(persistedParent.anchor)),
+                          git.remoteHead("origin", String(persistedParent.parent)),
+                        ]);
+                      parentHostedBaseVerified =
+                        rewriteBoundaryParents.length === 1 &&
+                        rewriteBoundaryParents[0] === String(persistedParent.anchor) &&
+                        Option.isSome(hostedBaseHead) &&
+                        hostedBaseHead.value === parentBoundary.value.base &&
+                        Option.isSome(hostedBaseAnchor) &&
+                        hostedBaseAnchor.value === String(persistedParent.anchor) &&
+                        Option.isSome(remoteBase) &&
+                        remoteBase.value === parentBoundary.value.base;
+                    }
+                    if (
                       parentBoundary.value.head !== savedParentHead ||
-                      parentBoundary.value.base !== String(persistedParent.anchor) ||
+                      !parentHostedBaseVerified ||
                       Option.isNone(branchHead) ||
                       childBoundary.value.head !== branchHead.value
                     ) {

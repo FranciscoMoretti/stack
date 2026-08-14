@@ -602,11 +602,24 @@ const promotedTriggerFixture = (root: string, rootMerged: boolean) =>
     };
   });
 
-const promotedLintFixture = (root: string, patchDrift = false) =>
+const promotedLintFixture = (
+  root: string,
+  opts?: {
+    readonly advancedTrunk?: boolean;
+    readonly childBranch?: string;
+    readonly descendantBranch?: string;
+    readonly patchDrift?: boolean;
+    readonly rootBranch?: string;
+    readonly rootReviewFix?: boolean;
+  },
+) =>
   Effect.gen(function* () {
     const origin = join(root, "origin.git");
     const author = join(root, "author");
     const repo = join(root, "fresh");
+    const rootBranch = opts?.rootBranch ?? "root";
+    const childBranch = opts?.childBranch ?? "child";
+    const descendantBranch = opts?.descendantBranch ?? "descendant";
 
     yield* shell(root, "git", ["init", "--bare", origin]);
     yield* mkdirp(author);
@@ -633,9 +646,17 @@ const promotedLintFixture = (root: string, patchDrift = false) =>
       "named rule\n",
       "ALA-2999 Enable Oxlint import/named rule",
     );
+    if (opts?.rootReviewFix) {
+      yield* commitFile(
+        author,
+        "native-labels.ts",
+        "preserve native labels\n",
+        "ALA-3026 Preserve native checkbox labels",
+      );
+    }
     const historicalRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
 
-    yield* shell(author, "git", ["checkout", "-b", "child"]);
+    yield* shell(author, "git", ["checkout", "-b", childBranch]);
     yield* commitFile(
       author,
       "zero-baseline.ts",
@@ -643,66 +664,105 @@ const promotedLintFixture = (root: string, patchDrift = false) =>
       "ALA-3000 Enable zero-baseline native Oxlint rules",
     );
     const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
-    yield* shell(author, "git", ["push", "-u", "origin", "child"]);
-    yield* shell(author, "git", ["checkout", "-b", "descendant"]);
+    yield* shell(author, "git", ["push", "-u", "origin", childBranch]);
+    yield* shell(author, "git", ["checkout", "-b", descendantBranch]);
     yield* commitFile(author, "descendant.ts", "deeper\n", "deeper lint layer");
     const originalDescendant = yield* shell(author, "git", ["rev-parse", "HEAD"]);
-    yield* shell(author, "git", ["push", "-u", "origin", "descendant"]);
+    yield* shell(author, "git", ["push", "-u", "origin", descendantBranch]);
 
     yield* shell(author, "git", ["checkout", "main"]);
     yield* shell(author, "git", ["merge", "--squash", inheritedCommit]);
     yield* shell(author, "git", ["commit", "-m", "merge import export rule"]);
     const rootAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
-    yield* shell(author, "git", ["checkout", "-b", "root"]);
-    yield* shell(author, "git", ["cherry-pick", historicalRoot]);
-    if (patchDrift) {
+    yield* shell(author, "git", ["checkout", "-b", rootBranch]);
+    yield* shell(author, "git", ["cherry-pick", `${inheritedCommit}..${historicalRoot}`]);
+    if (opts?.patchDrift) {
       yield* put(join(author, "named-rule.ts"), "drifted named rule\n");
       yield* shell(author, "git", ["add", "named-rule.ts"]);
       yield* shell(author, "git", ["commit", "--amend", "--no-edit"]);
     }
     const currentRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
-    yield* shell(author, "git", ["push", "-u", "origin", "main", "root"]);
+    const currentRootBoundary = yield* shell(author, "git", ["rev-parse", "HEAD^"]);
+    if (opts?.advancedTrunk) {
+      yield* shell(author, "git", ["checkout", "main"]);
+      yield* commitFile(author, "unrelated-main.txt", "advanced\n", "advance trunk independently");
+    }
+    yield* shell(author, "git", ["push", "-u", "origin", "main", rootBranch]);
 
     yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
     yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
     yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
-    yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+    yield* shell(repo, "git", [
+      "fetch",
+      "origin",
+      `${rootBranch}:${rootBranch}`,
+      `${childBranch}:${childBranch}`,
+    ]);
 
     return {
       author,
+      childBranch,
+      descendantBranch,
       repo,
       persistedChildAnchor,
       rootAnchor,
       historicalRoot,
       currentRoot,
+      currentRootBoundary,
+      currentMain: yield* shell(repo, "git", ["rev-parse", "main"]),
       originalChild,
       originalDescendant,
+      rootBranch,
     };
   });
 
 const verifyPromotedLintLanding = (opts?: {
+  readonly advancedTrunk?: boolean;
+  readonly exactFixture?: boolean;
   readonly failure?:
+    | "identity-mismatch"
     | "missing-hosted-lineage"
     | "missing-transition"
     | "moved-child"
     | "moved-root"
+    | "moved-trunk"
     | "patch-drift"
-    | "stale-hosted-lineage";
+    | "stale-hosted-lineage"
+    | "stale-trunk-boundary";
 }) =>
   Effect.gen(function* () {
     const root = yield* tempDir();
-    const fixture = yield* promotedLintFixture(root, opts?.failure === "patch-drift");
+    const fixture = yield* promotedLintFixture(root, {
+      ...(opts?.advancedTrunk ? { advancedTrunk: true } : {}),
+      ...(opts?.exactFixture
+        ? {
+            childBranch: "francisco/ala-3027-warning-comments",
+            descendantBranch: "francisco/ala-3028-next-layer",
+            rootBranch: "francisco/ala-3026-associated-labels",
+            rootReviewFix: true,
+          }
+        : {}),
+      patchDrift: opts?.failure === "patch-drift",
+    });
     const log: Array<string> = [];
+    const rootPr = opts?.exactFixture ? 3890 : 3886;
+    const childPr = opts?.exactFixture ? 3891 : 3887;
+    const descendantPr = opts?.exactFixture ? 3892 : 3888;
 
     if (opts?.failure === "moved-root") {
-      yield* shell(fixture.author, "git", ["checkout", "root"]);
+      yield* shell(fixture.author, "git", ["checkout", fixture.rootBranch]);
       yield* commitFile(fixture.author, "late-root.ts", "moved root\n", "move lint root");
-      yield* shell(fixture.author, "git", ["push", "origin", "root"]);
+      yield* shell(fixture.author, "git", ["push", "origin", fixture.rootBranch]);
     }
     if (opts?.failure === "moved-child") {
-      yield* shell(fixture.author, "git", ["checkout", "child"]);
+      yield* shell(fixture.author, "git", ["checkout", fixture.childBranch]);
       yield* commitFile(fixture.author, "late-child.ts", "moved child\n", "move lint child");
-      yield* shell(fixture.author, "git", ["push", "origin", "child"]);
+      yield* shell(fixture.author, "git", ["push", "origin", fixture.childBranch]);
+    }
+    if (opts?.failure === "moved-trunk") {
+      yield* shell(fixture.author, "git", ["checkout", "main"]);
+      yield* commitFile(fixture.author, "later-main.txt", "later\n", "move trunk again");
+      yield* shell(fixture.author, "git", ["push", "origin", "main"]);
     }
 
     const cfgLayer = StackConfig.layer({ root: fixture.repo, trunks: ["main"] }).pipe(
@@ -718,14 +778,26 @@ const verifyPromotedLintLanding = (opts?: {
         integrationGitHub({
           repo: fixture.repo,
           log,
-          pulls: [pr(3886, "root", "main"), pr(3887, "child", "root")],
-          metas: [metaFor(pr(3886, "root", "main")), metaFor(pr(3887, "child", "root"))],
+          pulls: [
+            pr(rootPr, fixture.rootBranch, "main"),
+            pr(childPr, fixture.childBranch, fixture.rootBranch),
+          ],
+          metas: [
+            metaFor(pr(rootPr, fixture.rootBranch, "main")),
+            metaFor(
+              pr(
+                childPr,
+                opts?.failure === "identity-mismatch" ? "wrong-child" : fixture.childBranch,
+                fixture.rootBranch,
+              ),
+            ),
+          ],
           ...(opts?.failure === "missing-transition"
             ? {}
             : {
                 replayBases: new Map([
                   [
-                    3886,
+                    rootPr,
                     {
                       kind: "force-push-boundary" as const,
                       currentBase: "main",
@@ -734,7 +806,7 @@ const verifyPromotedLintLanding = (opts?: {
                           ? fixture.persistedChildAnchor
                           : fixture.historicalRoot,
                       semanticHead: fixture.currentRoot,
-                      boundary: fixture.rootAnchor,
+                      boundary: fixture.currentRootBoundary,
                     },
                   ],
                 ]),
@@ -742,13 +814,24 @@ const verifyPromotedLintLanding = (opts?: {
           ...(opts?.failure === "missing-hosted-lineage"
             ? {
                 changeBoundaries: new Map([
-                  [3886, { head: fixture.currentRoot, base: fixture.rootAnchor }],
+                  [rootPr, { head: fixture.currentRoot, base: fixture.currentMain }],
                 ]),
               }
             : {
                 changeBoundaries: new Map([
-                  [3886, { head: fixture.currentRoot, base: fixture.rootAnchor }],
-                  [3887, { head: fixture.originalChild, base: fixture.currentRoot }],
+                  [
+                    rootPr,
+                    {
+                      head: fixture.currentRoot,
+                      base:
+                        opts?.failure === "stale-trunk-boundary"
+                          ? fixture.persistedChildAnchor
+                          : opts?.advancedTrunk
+                            ? fixture.currentMain
+                            : fixture.rootAnchor,
+                    },
+                  ],
+                  [childPr, { head: fixture.originalChild, base: fixture.currentRoot }],
                 ]),
               }),
         }),
@@ -758,12 +841,17 @@ const verifyPromotedLintLanding = (opts?: {
           new StackState({
             version: 1,
             links: [
-              stackLink({ branch: "root", parent: "main", anchor: fixture.rootAnchor, pr: 3886 }),
               stackLink({
-                branch: "child",
-                parent: "root",
+                branch: fixture.rootBranch,
+                parent: "main",
+                anchor: fixture.rootAnchor,
+                pr: rootPr,
+              }),
+              stackLink({
+                branch: fixture.childBranch,
+                parent: fixture.rootBranch,
                 anchor: fixture.persistedChildAnchor,
-                pr: 3887,
+                pr: childPr,
               }),
             ],
           }),
@@ -772,33 +860,40 @@ const verifyPromotedLintLanding = (opts?: {
     );
     const operation = Effect.gen(function* () {
       const stack = yield* Stack;
-      const preview = yield* stack.land("root", { repairDepth: 1 });
-      const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+      const preview = yield* stack.land(fixture.rootBranch, { repairDepth: 1 });
+      const applied = yield* stack.land(fixture.rootBranch, { apply: true, repairDepth: 1 });
       return { preview, applied, history: yield* stack.last() };
     }).pipe(Effect.provide(layer));
 
     if (opts?.failure) {
       const error = yield* Effect.flip(operation);
       const expected = {
+        "identity-mismatch": "hosted change identity diverged",
         "missing-hosted-lineage": "hosted change boundary required",
         "missing-transition": "hosted replay boundary diverged",
         "moved-child": "remote head diverged",
         "moved-root": "remote head diverged",
+        "moved-trunk": "hosted replay boundary diverged",
         "patch-drift": "semantic patches differ",
         "stale-hosted-lineage": "hosted replay boundary diverged",
+        "stale-trunk-boundary": "hosted replay boundary diverged",
       }[opts.failure];
       expect(String(error)).toContain(expected);
-      expect(yield* shell(fixture.repo, "git", ["rev-parse", "child"])).toBe(fixture.originalChild);
-      expect(yield* shell(fixture.repo, "git", ["branch", "--list", "descendant"])).toBe("");
-      expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/descendant"])).toBe(
-        fixture.originalDescendant,
+      expect(yield* shell(fixture.repo, "git", ["rev-parse", fixture.childBranch])).toBe(
+        fixture.originalChild,
       );
+      expect(
+        yield* shell(fixture.repo, "git", ["branch", "--list", fixture.descendantBranch]),
+      ).toBe("");
+      expect(
+        yield* shell(fixture.repo, "git", ["rev-parse", `origin/${fixture.descendantBranch}`]),
+      ).toBe(fixture.originalDescendant);
       return;
     }
 
     const result = yield* operation;
     const mainHead = yield* shell(fixture.repo, "git", ["rev-parse", "main"]);
-    const childHead = yield* shell(fixture.repo, "git", ["rev-parse", "child"]);
+    const childHead = yield* shell(fixture.repo, "git", ["rev-parse", fixture.childBranch]);
     const replayedSubjects = yield* shell(fixture.repo, "git", [
       "log",
       "--reverse",
@@ -807,22 +902,26 @@ const verifyPromotedLintLanding = (opts?: {
       "--format=%s",
       `${mainHead}..${childHead}`,
     ]);
-    expect(result.preview.join("\n")).toContain("would merge #3886 (root)");
-    expect(result.preview.join("\n")).toContain("would rebase child onto main");
-    expect(result.preview.join("\n")).not.toContain("descendant");
-    expect(result.applied.join("\n")).toContain("next root: child");
-    expect(result.applied.join("\n")).not.toContain("descendant");
+    expect(result.preview.join("\n")).toContain(`would merge #${rootPr} (${fixture.rootBranch})`);
+    expect(result.preview.join("\n")).toContain(`would rebase ${fixture.childBranch} onto main`);
+    expect(result.preview.join("\n")).not.toContain(fixture.descendantBranch);
+    expect(result.applied.join("\n")).toContain(`next root: ${fixture.childBranch}`);
+    expect(result.applied.join("\n")).not.toContain(fixture.descendantBranch);
     expect(replayedSubjects).toBe("ALA-3000 Enable zero-baseline native Oxlint rules");
     expect(replayedSubjects).not.toContain("ALA-3001");
     expect(replayedSubjects).not.toContain("ALA-2999");
-    expect(result.history).toContain("rebase child onto main");
-    expect(result.history).toContain("push child");
-    expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
-    expect(yield* shell(fixture.repo, "git", ["branch", "--list", "descendant"])).toBe("");
-    expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/descendant"])).toBe(
-      fixture.originalDescendant,
+    expect(result.history).toContain(`rebase ${fixture.childBranch} onto main`);
+    expect(result.history).toContain(`push ${fixture.childBranch}`);
+    expect(yield* shell(fixture.repo, "git", ["rev-parse", `origin/${fixture.childBranch}`])).toBe(
+      childHead,
     );
-    expect(log).not.toContain("body 3888");
+    expect(yield* shell(fixture.repo, "git", ["branch", "--list", fixture.descendantBranch])).toBe(
+      "",
+    );
+    expect(
+      yield* shell(fixture.repo, "git", ["rev-parse", `origin/${fixture.descendantBranch}`]),
+    ).toBe(fixture.originalDescendant);
+    expect(log).not.toContain(`body ${descendantPr}`);
   });
 
 const verifyDirectParentAnchorLanding = (opts: {
@@ -8276,6 +8375,42 @@ describe("Stack", () => {
     () => verifyPromotedLintLanding().pipe(Effect.provide(platform)),
     30_000,
   );
+
+  it.effect(
+    "lands the warning-comment child after the associated-label root is promoted and trunk advances",
+    () =>
+      verifyPromotedLintLanding({ advancedTrunk: true, exactFixture: true }).pipe(
+        Effect.provide(platform),
+      ),
+    30_000,
+  );
+
+  it.effect(
+    "fails closed when the hosted PR identity does not match the promoted child branch",
+    () =>
+      verifyPromotedLintLanding({
+        advancedTrunk: true,
+        exactFixture: true,
+        failure: "identity-mismatch",
+      }).pipe(Effect.provide(platform)),
+    30_000,
+  );
+
+  for (const [failure, label] of [
+    ["moved-trunk", "the promoted root hosted base no longer matches remote trunk"],
+    ["stale-trunk-boundary", "the promoted root hosted base predates its persisted anchor"],
+  ] as const) {
+    it.effect(
+      `fails closed when ${label}`,
+      () =>
+        verifyPromotedLintLanding({
+          advancedTrunk: true,
+          exactFixture: true,
+          failure,
+        }).pipe(Effect.provide(platform)),
+      30_000,
+    );
+  }
 
   for (const [failure, label] of [
     ["missing-hosted-lineage", "missing promoted-child hosted lineage"],
