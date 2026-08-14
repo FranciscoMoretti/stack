@@ -1340,6 +1340,7 @@ describe("Git", () => {
             if (args[0] === "cherry-pick" && args[1] !== "--abort") {
               return yield* Effect.fail(new ExecError(tool, args, 1, "conflict"));
             }
+            if (args[0] === "diff") return "conflicted.py";
             return "";
           }),
       }),
@@ -1363,6 +1364,54 @@ describe("Git", () => {
         ["git", "cherry-pick", "--abort"],
         ["git", "checkout", "stack-c"],
         ["git", "branch", "-D", temp],
+      ]);
+    }).pipe(Effect.provide(Git.live.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))));
+  });
+
+  it.effect("replay continues a rerere-resolved cherry-pick", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    let continuationAttempts = 0;
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.gen(function* () {
+            calls.push([tool, ...args]);
+            if (args[0] === "branch" && args[1] === "--show-current") return "stack-c";
+            if (args[0] === "cherry-pick" && args[1] === "--empty=drop") {
+              return yield* Effect.fail(
+                new ExecError(tool, args, 1, "rerere staged the resolution"),
+              );
+            }
+            if (
+              args[0] === "cherry-pick" &&
+              args[1] === "--continue" &&
+              continuationAttempts++ === 0
+            ) {
+              return yield* Effect.fail(
+                new ExecError(tool, args, 1, "rerere staged the next resolution"),
+              );
+            }
+            return "";
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(1_700_000_000_000);
+      const git = yield* Git.Service;
+
+      yield* git.replay("stack-b", "dev", ["b1"]);
+
+      expect(calls.filter((call) => call.join(" ") === "git cherry-pick --continue")).toHaveLength(
+        2,
+      );
+      expect(calls).toContainEqual([
+        "git",
+        "branch",
+        "-f",
+        "stack-b",
+        "stack/replay-1700000000000-stack-b",
       ]);
     }).pipe(Effect.provide(Git.live.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))));
   });
@@ -1710,6 +1759,63 @@ describe("GitHub", () => {
       ]);
       expect(calls[4]).toContain("number=100");
       expect(calls[4]).toContainEqual(expect.stringContaining("HEAD_REF_FORCE_PUSHED_EVENT"));
+    }).pipe(
+      Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
+    );
+  });
+
+  it.effect("recovers a landed parent from the persisted base when GitHub omits the event", () => {
+    const calls: Array<ReadonlyArray<string>> = [];
+    const proc = Layer.succeed(
+      Proc.Service,
+      Proc.Service.of({
+        exec: (_cwd, tool, args) =>
+          Effect.sync(() => {
+            calls.push([tool, ...args]);
+            if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "alaro-ai/alaro" });
+            if (args[0] === "api") {
+              return JSON.stringify({
+                data: { repository: { pullRequest: { timelineItems: { nodes: [] } } } },
+              });
+            }
+            return JSON.stringify([
+              {
+                number: 100,
+                headRefName: "landed-parent",
+                headRefOid: "exact-parent-head",
+                mergedAt: "2026-08-07T07:44:04Z",
+              },
+            ]);
+          }),
+      }),
+    );
+
+    return Effect.gen(function* () {
+      const github = yield* CodeHost.Service;
+      const replayBase = yield* github.replayBase(101, "main", "landed-parent");
+
+      expect(Option.getOrUndefined(replayBase)).toEqual({
+        kind: "merged-parent",
+        branch: "landed-parent",
+        currentBase: "main",
+        head: "exact-parent-head",
+        historicalHeads: [],
+        fetchRef: "refs/pull/100/head",
+        change: 100,
+      });
+      expect(calls[3]).toEqual([
+        "gh",
+        "pr",
+        "list",
+        "--state",
+        "merged",
+        "--head",
+        "landed-parent",
+        "--json",
+        "number,headRefName,headRefOid,mergedAt",
+        "--limit",
+        "100",
+      ]);
     }).pipe(
       Effect.provide(CodeHostGitHub.layer.pipe(Layer.provideMerge(cfg), Layer.provideMerge(proc))),
     );
@@ -3626,6 +3732,69 @@ describe("Stack", () => {
 
       expect(seen).toContain("rebase child origin/dev child-only");
       expect(seen).not.toContain("rebase child origin/dev parent-1,parent-2,child-only");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("sync recovers the post-merge suffix when GitHub omits the retarget event", () => {
+    const seen: Array<string> = [];
+    const layer = stackTestLayer({
+      current: "child",
+      refs: [
+        ref("dev", "dev-squash"),
+        ref("child", "child-head"),
+        ref("landed-parent", "landed-parent"),
+      ],
+      pulls: [pr(2, "child", "dev")],
+      bases: bases(
+        ["child", "dev", "dev-squash"],
+        ["child", "origin/dev", "dev-squash"],
+        ["landed-parent", "parent-anchor", "parent-anchor"],
+        ["child", "landed-parent", "parent-boundary"],
+        ["child", "parent-boundary", "parent-boundary"],
+        ["landed-parent", "parent-boundary", "parent-boundary"],
+      ),
+      state: stackState([
+        stackLink({ branch: "parent", parent: "dev", anchor: "dev-old", pr: 1 }),
+        stackLink({ branch: "child", parent: "parent", anchor: "parent-anchor", pr: 2 }),
+      ]),
+      service: {
+        mergeParents: (branch) => Effect.succeed(branch === "child" ? ["parent-boundary"] : []),
+        commits: (from, branch) =>
+          Effect.succeed(
+            branch === "child" && from === "parent-anchor"
+              ? ["parent-1", "parent-2", "child-one", "child-two"]
+              : branch === "child" && from === "parent-boundary"
+                ? ["child-one", "child-two"]
+                : [],
+          ),
+        replayBase: () =>
+          Effect.succeed(
+            Option.some<CodeHost.ReplayBase>({
+              kind: "merged-parent",
+              branch: "parent",
+              currentBase: "dev",
+              head: "landed-parent",
+              historicalHeads: [],
+              fetchRef: "refs/pull/1/head",
+              change: 1,
+            }),
+          ),
+        fetchRef: () => Effect.succeed("landed-parent"),
+        novel: (parent, branch, commits) =>
+          Effect.sync(() => {
+            seen.push(`rebase ${branch} ${parent} ${commits.join(",")}`);
+            return commits;
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ apply: true });
+
+      expect(seen).toContain("rebase child origin/dev child-one,child-two");
+      expect(seen.join("\n")).not.toContain("parent-1");
+      expect(seen.join("\n")).not.toContain("parent-2");
     }).pipe(Effect.provide(layer));
   });
 

@@ -333,22 +333,33 @@ export const live = Layer.effect(
       const restoreCurrent = current
         ? runAt(root, "git", ["checkout", current]).pipe(Effect.asVoid, Effect.orDie)
         : Effect.void;
+      const unresolvedPaths = () =>
+        runAt(root, "git", ["diff", "--name-only", "--diff-filter=U"]).pipe(
+          Effect.map((out) => out.split("\n").filter(Boolean)),
+          Effect.catch(() => Effect.succeed([] as ReadonlyArray<string>)),
+        );
+      function continueResolvedCherryPick(
+        cherryPickError: ExecError,
+      ): Effect.Effect<void, ReplayConflictError> {
+        return Effect.gen(function* () {
+          const paths = yield* unresolvedPaths();
+          if (paths.length > 0) {
+            return yield* Effect.fail(
+              new ReplayConflictError(branch, parent, paths, cherryPickError.stderr),
+            );
+          }
+          yield* runAt(root, "git", ["cherry-pick", "--continue"])
+            .pipe(Effect.asVoid)
+            .pipe(Effect.catchTag("ExecError", continueResolvedCherryPick));
+        });
+      }
 
       yield* Effect.gen(function* () {
         yield* runAt(root, "git", ["checkout", "-B", temp, parent]).pipe(Effect.asVoid);
         if (commits.length > 0) {
           yield* runAt(root, "git", ["cherry-pick", "--empty=drop", ...commits]).pipe(
             Effect.asVoid,
-            Effect.catchTag("ExecError", (err) =>
-              Effect.gen(function* () {
-                const paths = yield* unmergedPaths().pipe(
-                  Effect.catch(() => Effect.succeed([] as ReadonlyArray<string>)),
-                );
-                return yield* Effect.fail(
-                  new ReplayConflictError(branch, parent, paths, err.stderr),
-                );
-              }),
-            ),
+            Effect.catchTag("ExecError", continueResolvedCherryPick),
           );
         }
         if (owner) {

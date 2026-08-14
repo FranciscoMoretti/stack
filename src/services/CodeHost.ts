@@ -47,6 +47,7 @@ export interface Interface {
   readonly replayBase: (
     number: number,
     currentBase: string,
+    previousBase?: string,
   ) => Effect.Effect<Option.Option<ReplayBase>, CodeHostError>;
   readonly edit: (pr: number, base: string) => Effect.Effect<void, CodeHostError>;
   readonly body: (pr: number, body: string) => Effect.Effect<void, CodeHostError>;

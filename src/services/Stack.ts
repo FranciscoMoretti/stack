@@ -646,6 +646,7 @@ ${note}`;
             const actions: Array<StackResult.StackResultItem> = [];
             const kept = new Array<StackLink>();
             const replayAnchors = new Map<string, string>();
+            const replayParents = new Map<string, string>();
 
             for (const link of state.links) {
               const branch = String(link.branch);
@@ -687,7 +688,10 @@ ${note}`;
                 if (Option.isSome(anchor)) {
                   const oldParent = String(link.parent);
                   const oldParentTracked = plannedParents.has(oldParent) || trunks.has(oldParent);
-                  if (!oldParentTracked) replayAnchors.set(branch, String(link.anchor));
+                  if (!oldParentTracked) {
+                    replayAnchors.set(branch, String(link.anchor));
+                    replayParents.set(branch, oldParent);
+                  }
                   const next = stackLink({
                     branch,
                     parent,
@@ -740,6 +744,7 @@ ${note}`;
               state: stackState(reconciled.sort((a, b) => a.branch.localeCompare(b.branch))),
               actions,
               replayAnchors,
+              replayParents,
             };
           }),
       );
@@ -769,6 +774,7 @@ ${note}`;
             readonly journalActions?: ReadonlyArray<StackResult.StackResultItem>;
             readonly initialActions?: ReadonlyArray<StackResult.StackResultItem>;
             readonly replayAnchors?: ReadonlyMap<string, string>;
+            readonly replayParents?: ReadonlyMap<string, string>;
             readonly writeState?: (
               state: ReturnType<typeof stackState>,
             ) => Effect.Effect<void, StackError>;
@@ -780,6 +786,7 @@ ${note}`;
             const apply = opts.apply;
             const saved = opts.saved ?? new Map<string, string>();
             const replayAnchors = opts.replayAnchors ?? new Map<string, string>();
+            const replayParents = opts.replayParents ?? new Map<string, string>();
             const journalState = opts.journalState ?? state;
             const journalActions = opts.journalActions ?? [];
             const initialActions = opts.initialActions ?? [];
@@ -890,7 +897,11 @@ ${note}`;
                   ? Array.from(landedBackups)
                   : [];
               if (!savedParent && trunk(parent) && link.pr) {
-                const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
+                const recovered = yield* codeHost.replayBase(
+                  Number(link.pr),
+                  parent,
+                  replayParents.get(branch) ?? String(link.parent),
+                );
                 if (Option.isSome(recovered)) {
                   if (recovered.value.kind === "force-push-boundary") {
                     const { boundary, semanticHead } = recovered.value;
@@ -931,6 +942,7 @@ ${note}`;
                 }
               }
               const all = yield* git.commits(anchor, branch);
+              const branchMergeParents = yield* git.mergeParents(branch);
               let selected = all;
               let matchedParentPrefix = 0;
               let savedParentBoundaryVerified = false;
@@ -956,6 +968,29 @@ ${note}`;
                   embeddedCandidate.value === anchor &&
                   preservedMergeParents.includes(anchor)
                 ) {
+                  savedParentBoundaryVerified = true;
+                  break;
+                }
+                const preservedBoundary = yield* Effect.findFirst(
+                  branchMergeParents,
+                  (mergeParent) =>
+                    Effect.gen(function* () {
+                      const [embeddedBoundary, candidateContainsBoundary] = yield* Effect.all([
+                        git.base(branch, mergeParent),
+                        git.base(candidate, mergeParent),
+                      ]);
+                      return (
+                        Option.isSome(embeddedBoundary) &&
+                        embeddedBoundary.value === mergeParent &&
+                        Option.isSome(candidateContainsBoundary) &&
+                        candidateContainsBoundary.value === mergeParent
+                      );
+                    }),
+                );
+                if (Option.isSome(preservedBoundary)) {
+                  const commits = yield* git.commits(preservedBoundary.value, branch);
+                  selected = commits;
+                  matchedParentPrefix = all.length - commits.length;
                   savedParentBoundaryVerified = true;
                   break;
                 }
@@ -1387,12 +1422,20 @@ ${note}`;
                         ),
                       )
                     : reconciled.replayAnchors;
+                  const replayParents = target
+                    ? new Map(
+                        [...reconciled.replayParents].filter(([branch]) =>
+                          target.branches.has(branch),
+                        ),
+                      )
+                    : reconciled.replayParents;
                   const writeState = target ? writeScopedState(target.branches) : undefined;
                   const scopedPulls = yield* changesForLinks(scoped.links, pulls);
                   const repair = yield* repairStack(scoped, refs, scopedPulls, {
                     apply: !dryRun,
                     journalState: state,
                     replayAnchors,
+                    replayParents,
                     initialActions: scopedInitial,
                     ...(writeState ? { writeState } : {}),
                     preserveUndo,
