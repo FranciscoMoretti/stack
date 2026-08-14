@@ -602,6 +602,229 @@ const promotedTriggerFixture = (root: string, rootMerged: boolean) =>
     };
   });
 
+const promotedLintFixture = (root: string, patchDrift = false) =>
+  Effect.gen(function* () {
+    const origin = join(root, "origin.git");
+    const author = join(root, "author");
+    const repo = join(root, "fresh");
+
+    yield* shell(root, "git", ["init", "--bare", origin]);
+    yield* mkdirp(author);
+    yield* shell(author, "git", ["init", "-b", "main"]);
+    yield* shell(author, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(author, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(author, "git", ["remote", "add", "origin", origin]);
+    yield* commitFile(author, "baseline.txt", "baseline\n", "persisted lint anchor");
+    const persistedChildAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "main"]);
+    yield* shell(root, "git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "historical-root"]);
+    yield* commitFile(
+      author,
+      "export-rule.ts",
+      "export rule\n",
+      "ALA-3001 Enable Oxlint import/export rule",
+    );
+    const inheritedCommit = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* commitFile(
+      author,
+      "named-rule.ts",
+      "named rule\n",
+      "ALA-2999 Enable Oxlint import/named rule",
+    );
+    const historicalRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+
+    yield* shell(author, "git", ["checkout", "-b", "child"]);
+    yield* commitFile(
+      author,
+      "zero-baseline.ts",
+      "zero baseline\n",
+      "ALA-3000 Enable zero-baseline native Oxlint rules",
+    );
+    const originalChild = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "child"]);
+    yield* shell(author, "git", ["checkout", "-b", "descendant"]);
+    yield* commitFile(author, "descendant.ts", "deeper\n", "deeper lint layer");
+    const originalDescendant = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "descendant"]);
+
+    yield* shell(author, "git", ["checkout", "main"]);
+    yield* shell(author, "git", ["merge", "--squash", inheritedCommit]);
+    yield* shell(author, "git", ["commit", "-m", "merge import export rule"]);
+    const rootAnchor = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["checkout", "-b", "root"]);
+    yield* shell(author, "git", ["cherry-pick", historicalRoot]);
+    if (patchDrift) {
+      yield* put(join(author, "named-rule.ts"), "drifted named rule\n");
+      yield* shell(author, "git", ["add", "named-rule.ts"]);
+      yield* shell(author, "git", ["commit", "--amend", "--no-edit"]);
+    }
+    const currentRoot = yield* shell(author, "git", ["rev-parse", "HEAD"]);
+    yield* shell(author, "git", ["push", "-u", "origin", "main", "root"]);
+
+    yield* shell(root, "git", ["clone", "--no-local", origin, repo]);
+    yield* shell(repo, "git", ["config", "user.email", "stack@example.com"]);
+    yield* shell(repo, "git", ["config", "user.name", "Stack Test"]);
+    yield* shell(repo, "git", ["fetch", "origin", "root:root", "child:child"]);
+
+    return {
+      author,
+      repo,
+      persistedChildAnchor,
+      rootAnchor,
+      historicalRoot,
+      currentRoot,
+      originalChild,
+      originalDescendant,
+    };
+  });
+
+const verifyPromotedLintLanding = (opts?: {
+  readonly failure?:
+    | "missing-hosted-lineage"
+    | "missing-transition"
+    | "moved-child"
+    | "moved-root"
+    | "patch-drift"
+    | "stale-hosted-lineage";
+}) =>
+  Effect.gen(function* () {
+    const root = yield* tempDir();
+    const fixture = yield* promotedLintFixture(root, opts?.failure === "patch-drift");
+    const log: Array<string> = [];
+
+    if (opts?.failure === "moved-root") {
+      yield* shell(fixture.author, "git", ["checkout", "root"]);
+      yield* commitFile(fixture.author, "late-root.ts", "moved root\n", "move lint root");
+      yield* shell(fixture.author, "git", ["push", "origin", "root"]);
+    }
+    if (opts?.failure === "moved-child") {
+      yield* shell(fixture.author, "git", ["checkout", "child"]);
+      yield* commitFile(fixture.author, "late-child.ts", "moved child\n", "move lint child");
+      yield* shell(fixture.author, "git", ["push", "origin", "child"]);
+    }
+
+    const cfgLayer = StackConfig.layer({ root: fixture.repo, trunks: ["main"] }).pipe(
+      Layer.provide(NodeServices.layer),
+    );
+    const layer = Stack.layer.pipe(
+      Layer.provideMerge(Progress.noop),
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Proc.live),
+      Layer.provideMerge(cfgLayer),
+      Layer.provideMerge(Git.live.pipe(Layer.provide(cfgLayer))),
+      Layer.provideMerge(
+        integrationGitHub({
+          repo: fixture.repo,
+          log,
+          pulls: [pr(3886, "root", "main"), pr(3887, "child", "root")],
+          metas: [metaFor(pr(3886, "root", "main")), metaFor(pr(3887, "child", "root"))],
+          ...(opts?.failure === "missing-transition"
+            ? {}
+            : {
+                replayBases: new Map([
+                  [
+                    3886,
+                    {
+                      kind: "force-push-boundary" as const,
+                      currentBase: "main",
+                      before:
+                        opts?.failure === "stale-hosted-lineage"
+                          ? fixture.persistedChildAnchor
+                          : fixture.historicalRoot,
+                      semanticHead: fixture.currentRoot,
+                      boundary: fixture.rootAnchor,
+                    },
+                  ],
+                ]),
+              }),
+          ...(opts?.failure === "missing-hosted-lineage"
+            ? {
+                changeBoundaries: new Map([
+                  [3886, { head: fixture.currentRoot, base: fixture.rootAnchor }],
+                ]),
+              }
+            : {
+                changeBoundaries: new Map([
+                  [3886, { head: fixture.currentRoot, base: fixture.rootAnchor }],
+                  [3887, { head: fixture.originalChild, base: fixture.currentRoot }],
+                ]),
+              }),
+        }),
+      ),
+      Layer.provideMerge(
+        Store.memory(
+          new StackState({
+            version: 1,
+            links: [
+              stackLink({ branch: "root", parent: "main", anchor: fixture.rootAnchor, pr: 3886 }),
+              stackLink({
+                branch: "child",
+                parent: "root",
+                anchor: fixture.persistedChildAnchor,
+                pr: 3887,
+              }),
+            ],
+          }),
+        ),
+      ),
+    );
+    const operation = Effect.gen(function* () {
+      const stack = yield* Stack;
+      const preview = yield* stack.land("root", { repairDepth: 1 });
+      const applied = yield* stack.land("root", { apply: true, repairDepth: 1 });
+      return { preview, applied, history: yield* stack.last() };
+    }).pipe(Effect.provide(layer));
+
+    if (opts?.failure) {
+      const error = yield* Effect.flip(operation);
+      const expected = {
+        "missing-hosted-lineage": "hosted change boundary required",
+        "missing-transition": "hosted replay boundary diverged",
+        "moved-child": "remote head diverged",
+        "moved-root": "remote head diverged",
+        "patch-drift": "semantic patches differ",
+        "stale-hosted-lineage": "hosted replay boundary diverged",
+      }[opts.failure];
+      expect(String(error)).toContain(expected);
+      expect(yield* shell(fixture.repo, "git", ["rev-parse", "child"])).toBe(fixture.originalChild);
+      expect(yield* shell(fixture.repo, "git", ["branch", "--list", "descendant"])).toBe("");
+      expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/descendant"])).toBe(
+        fixture.originalDescendant,
+      );
+      return;
+    }
+
+    const result = yield* operation;
+    const mainHead = yield* shell(fixture.repo, "git", ["rev-parse", "main"]);
+    const childHead = yield* shell(fixture.repo, "git", ["rev-parse", "child"]);
+    const replayedSubjects = yield* shell(fixture.repo, "git", [
+      "log",
+      "--reverse",
+      "--first-parent",
+      "--no-merges",
+      "--format=%s",
+      `${mainHead}..${childHead}`,
+    ]);
+    expect(result.preview.join("\n")).toContain("would merge #3886 (root)");
+    expect(result.preview.join("\n")).toContain("would rebase child onto main");
+    expect(result.preview.join("\n")).not.toContain("descendant");
+    expect(result.applied.join("\n")).toContain("next root: child");
+    expect(result.applied.join("\n")).not.toContain("descendant");
+    expect(replayedSubjects).toBe("ALA-3000 Enable zero-baseline native Oxlint rules");
+    expect(replayedSubjects).not.toContain("ALA-3001");
+    expect(replayedSubjects).not.toContain("ALA-2999");
+    expect(result.history).toContain("rebase child onto main");
+    expect(result.history).toContain("push child");
+    expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/child"])).toBe(childHead);
+    expect(yield* shell(fixture.repo, "git", ["branch", "--list", "descendant"])).toBe("");
+    expect(yield* shell(fixture.repo, "git", ["rev-parse", "origin/descendant"])).toBe(
+      fixture.originalDescendant,
+    );
+    expect(log).not.toContain("body 3888");
+  });
+
 const verifyDirectParentAnchorLanding = (opts: {
   readonly childSubjects: ReadonlyArray<string>;
   readonly preservationMerge: boolean;
@@ -1299,6 +1522,10 @@ const verifyHostedPreservationWithAppendedRootLanding = (opts?: {
                 boundary: repairedBoundary,
               },
             ],
+          ]),
+          changeBoundaries: new Map([
+            [3602, { head: currentRoot, base: repairedBoundary }],
+            [3603, { head: originalChild, base: repairedSemanticHead }],
           ]),
         }),
       ),
@@ -7781,6 +8008,10 @@ describe("Stack", () => {
                   },
                 ],
               ]),
+              changeBoundaries: new Map([
+                [3563, { head: currentRoot, base: rootAnchor }],
+                [3564, { head: originalChild, base: currentRoot }],
+              ]),
             }),
           ),
           Layer.provideMerge(
@@ -8039,6 +8270,27 @@ describe("Stack", () => {
       }).pipe(Effect.provide(platform)),
     25_000,
   );
+
+  it.effect(
+    "lands the unchanged TypeScript-lint child after its parent is promoted",
+    () => verifyPromotedLintLanding().pipe(Effect.provide(platform)),
+    30_000,
+  );
+
+  for (const [failure, label] of [
+    ["missing-hosted-lineage", "missing promoted-child hosted lineage"],
+    ["missing-transition", "persisted-anchor divergence without a hosted transition"],
+    ["stale-hosted-lineage", "stale promoted-child hosted lineage"],
+    ["moved-root", "a moved promoted root"],
+    ["moved-child", "a moved unchanged historical child"],
+    ["patch-drift", "promoted-root semantic patch drift"],
+  ] as const) {
+    it.effect(
+      `fails closed for ${label}`,
+      () => verifyPromotedLintLanding({ failure }).pipe(Effect.provide(platform)),
+      30_000,
+    );
+  }
 
   it.effect(
     "recovers only the trigger-creation suffix after the parent was squash merged",

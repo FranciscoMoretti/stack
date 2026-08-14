@@ -1055,6 +1055,8 @@ ${note}`;
               let selectedMergeParents: ReadonlyArray<string> = [];
               let matchedParentPrefix = 0;
               let savedParentBoundaryVerified = false;
+              let recoveredParentRewrite: CodeHost.ReplayForcePushBoundary | null = null;
+              let recoveredParentRewritePatchVerified = false;
               const persistedParent = savedParent ? links.get(String(link.parent)) : undefined;
               const verifyHostedNestedPreservation = Effect.fn(
                 "Stack.repairStack.verifyHostedNestedPreservation",
@@ -1207,8 +1209,16 @@ ${note}`;
                           );
                         }
                         candidates.push(beforeParents[0]!);
-                      } else {
+                        recoveredParentRewrite = recoveredParent.value;
+                        recoveredParentRewritePatchVerified = true;
+                      } else if (beforeParents.length === 1) {
+                        const [historicalPatchId, repairedPatchId] = yield* Effect.all([
+                          git.patchId(beforeParents[0]!, before),
+                          git.patchId(boundary, semanticHead),
+                        ]);
                         candidates.push(before);
+                        recoveredParentRewrite = recoveredParent.value;
+                        recoveredParentRewritePatchVerified = historicalPatchId === repairedPatchId;
                       }
                     }
                   }
@@ -1291,8 +1301,7 @@ ${note}`;
                       parentBoundary.value.head !== savedParentHead ||
                       parentBoundary.value.base !== String(persistedParent.anchor) ||
                       Option.isNone(branchHead) ||
-                      childBoundary.value.head !== branchHead.value ||
-                      childBoundary.value.base !== anchor
+                      childBoundary.value.head !== branchHead.value
                     ) {
                       return yield* Effect.fail(
                         new StackOperationError(
@@ -1300,11 +1309,6 @@ ${note}`;
                         ),
                       );
                     }
-                    yield* verifyHostedNestedPreservation(
-                      savedParentHead,
-                      anchor,
-                      parentBoundary.value.base,
-                    );
                     const parentRemote = yield* headRemote(
                       persistedParent.headRepository ?? null,
                       Number(persistedParent.pr),
@@ -1329,8 +1333,35 @@ ${note}`;
                         ),
                       );
                     }
-                    savedParentBoundaryVerified = true;
-                    break;
+                    if (childBoundary.value.base === anchor) {
+                      yield* verifyHostedNestedPreservation(
+                        savedParentHead,
+                        anchor,
+                        parentBoundary.value.base,
+                      );
+                      savedParentBoundaryVerified = true;
+                      break;
+                    }
+                    if (
+                      recoveredParentRewrite === null ||
+                      !recoveredParentRewritePatchVerified ||
+                      (childBoundary.value.base !== savedParentHead &&
+                        childBoundary.value.base !== recoveredParentRewrite.semanticHead)
+                    ) {
+                      const detail =
+                        recoveredParentRewrite !== null && !recoveredParentRewritePatchVerified
+                          ? `cannot verify hosted parent rewrite ${recoveredParentRewrite.before} -> ${recoveredParentRewrite.semanticHead} for ${branch}: semantic patches differ`
+                          : `hosted replay boundary diverged for ${branch}; refusing persisted anchor ${anchor}`;
+                      return yield* Effect.fail(new StackOperationError(detail));
+                    }
+                    continue;
+                  }
+                  if (Option.isSome(parentBoundary) || Option.isSome(childBoundary)) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `hosted change boundary required for ${branch}; refusing promoted parent replay from persisted anchor ${anchor}`,
+                      ),
+                    );
                   }
                 }
                 if (
