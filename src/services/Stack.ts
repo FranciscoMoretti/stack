@@ -1328,6 +1328,15 @@ ${note}`;
                           git.base(parentBoundary.value.base, String(persistedParent.anchor)),
                           git.remoteHead("origin", String(persistedParent.parent)),
                         ]);
+                      const currentBaseContainsHostedBase = Option.isSome(remoteBase)
+                        ? yield* git
+                            .base(remoteBase.value, parentBoundary.value.base)
+                            .pipe(
+                              Effect.catchTag("ExecError", () =>
+                                Effect.succeed(Option.none<string>()),
+                              ),
+                            )
+                        : Option.none<string>();
                       parentHostedBaseVerified =
                         rewriteBoundaryParents.length === 1 &&
                         rewriteBoundaryParents[0] === String(persistedParent.anchor) &&
@@ -1336,7 +1345,8 @@ ${note}`;
                         Option.isSome(hostedBaseAnchor) &&
                         hostedBaseAnchor.value === String(persistedParent.anchor) &&
                         Option.isSome(remoteBase) &&
-                        remoteBase.value === parentBoundary.value.base;
+                        Option.isSome(currentBaseContainsHostedBase) &&
+                        currentBaseContainsHostedBase.value === parentBoundary.value.base;
                     }
                     if (
                       parentBoundary.value.head !== savedParentHead ||

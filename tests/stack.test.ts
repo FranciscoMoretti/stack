@@ -725,7 +725,7 @@ const verifyPromotedLintLanding = (opts?: {
     | "missing-transition"
     | "moved-child"
     | "moved-root"
-    | "moved-trunk"
+    | "diverged-trunk"
     | "patch-drift"
     | "stale-hosted-lineage"
     | "stale-trunk-boundary";
@@ -759,10 +759,15 @@ const verifyPromotedLintLanding = (opts?: {
       yield* commitFile(fixture.author, "late-child.ts", "moved child\n", "move lint child");
       yield* shell(fixture.author, "git", ["push", "origin", fixture.childBranch]);
     }
-    if (opts?.failure === "moved-trunk") {
-      yield* shell(fixture.author, "git", ["checkout", "main"]);
-      yield* commitFile(fixture.author, "later-main.txt", "later\n", "move trunk again");
-      yield* shell(fixture.author, "git", ["push", "origin", "main"]);
+    if (opts?.failure === "diverged-trunk") {
+      yield* shell(fixture.author, "git", [
+        "checkout",
+        "-b",
+        "diverged-main",
+        fixture.persistedChildAnchor,
+      ]);
+      yield* commitFile(fixture.author, "diverged-main.txt", "diverged\n", "diverge trunk");
+      yield* shell(fixture.author, "git", ["push", "--force", "origin", "HEAD:main"]);
     }
 
     const cfgLayer = StackConfig.layer({ root: fixture.repo, trunks: ["main"] }).pipe(
@@ -873,7 +878,7 @@ const verifyPromotedLintLanding = (opts?: {
         "missing-transition": "hosted replay boundary diverged",
         "moved-child": "remote head diverged",
         "moved-root": "remote head diverged",
-        "moved-trunk": "hosted replay boundary diverged",
+        "diverged-trunk": "hosted replay boundary diverged",
         "patch-drift": "semantic patches differ",
         "stale-hosted-lineage": "hosted replay boundary diverged",
         "stale-trunk-boundary": "hosted replay boundary diverged",
@@ -8397,7 +8402,7 @@ describe("Stack", () => {
   );
 
   for (const [failure, label] of [
-    ["moved-trunk", "the promoted root hosted base no longer matches remote trunk"],
+    ["diverged-trunk", "remote trunk diverges from the promoted root hosted base"],
     ["stale-trunk-boundary", "the promoted root hosted base predates its persisted anchor"],
   ] as const) {
     it.effect(
