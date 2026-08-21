@@ -1420,6 +1420,80 @@ ${note}`;
                 if (Option.isNone(embeddedAnchor) || embeddedAnchor.value !== anchor) continue;
                 const preservedMergeParents =
                   candidate === savedParent ? yield* git.mergeParents(candidate) : [];
+                const currentPreservationParents =
+                  candidate === savedParent && savedParentHead !== null
+                    ? yield* git.parents(savedParentHead)
+                    : [];
+                if (
+                  candidate === savedParent &&
+                  persistedParent?.pr &&
+                  link.pr &&
+                  savedParentHead !== null &&
+                  Option.isSome(embeddedCandidate) &&
+                  embeddedCandidate.value === anchor &&
+                  currentPreservationParents[0] === anchor &&
+                  currentPreservationParents.length > 1
+                ) {
+                  if (currentPreservationParents.length !== 2) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `cannot verify current preservation parent ${savedParentHead} for ${branch}: expected exactly two parents`,
+                      ),
+                    );
+                  }
+                  const parentRemote = yield* headRemote(
+                    persistedParent.headRepository ?? null,
+                    Number(persistedParent.pr),
+                  );
+                  const childRemote = yield* headRemote(
+                    link.headRepository ?? null,
+                    Number(link.pr),
+                  );
+                  const [remoteParentHead, branchHead, remoteBranchHead, remoteBaseHead] =
+                    yield* Effect.all([
+                      git.remoteHead(parentRemote, String(link.parent)),
+                      git.head(branch),
+                      git.remoteHead(childRemote, branch),
+                      git.remoteHead("origin", String(persistedParent.parent)),
+                    ]);
+                  const preservedBase = Option.isSome(remoteBaseHead)
+                    ? yield* git.base(remoteBaseHead.value, currentPreservationParents[1] ?? "")
+                    : Option.none<string>();
+                  if (
+                    Option.isNone(remoteParentHead) ||
+                    remoteParentHead.value !== savedParentHead
+                  ) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `current preservation parent remote head diverged for ${link.parent}; expected ${savedParentHead}`,
+                      ),
+                    );
+                  }
+                  if (
+                    Option.isNone(branchHead) ||
+                    Option.isNone(remoteBranchHead) ||
+                    remoteBranchHead.value !== branchHead.value
+                  ) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `current preservation child remote head diverged for ${branch}; expected ${Option.getOrNull(branchHead)}`,
+                      ),
+                    );
+                  }
+                  if (
+                    Option.isNone(remoteBaseHead) ||
+                    Option.isNone(preservedBase) ||
+                    preservedBase.value !== currentPreservationParents[1]
+                  ) {
+                    return yield* Effect.fail(
+                      new StackOperationError(
+                        `cannot verify current preservation parent ${savedParentHead} for ${branch}: second parent must be contained by the current ${persistedParent.parent}`,
+                      ),
+                    );
+                  }
+                  savedParentBoundaryVerified = true;
+                  break;
+                }
                 if (
                   candidate === savedParent &&
                   persistedParent?.pr &&
@@ -1563,64 +1637,6 @@ ${note}`;
                         `hosted change boundary required for ${branch}; refusing promoted parent replay from persisted anchor ${anchor}`,
                       ),
                     );
-                  }
-                }
-                if (
-                  candidate === savedParent &&
-                  persistedParent?.pr &&
-                  link.pr &&
-                  savedParentHead !== null &&
-                  Option.isSome(embeddedCandidate) &&
-                  embeddedCandidate.value === anchor
-                ) {
-                  const preservationParents = yield* git.parents(savedParentHead);
-                  if (preservationParents[0] === anchor && preservationParents.length > 1) {
-                    if (
-                      preservationParents.length !== 2 ||
-                      preservationParents[1] !== String(persistedParent.anchor)
-                    ) {
-                      return yield* Effect.fail(
-                        new StackOperationError(
-                          `cannot verify current preservation parent ${savedParentHead} for ${branch}: expected exactly two parents ${anchor} and ${persistedParent.anchor}`,
-                        ),
-                      );
-                    }
-                    const parentRemote = yield* headRemote(
-                      persistedParent.headRepository ?? null,
-                      Number(persistedParent.pr),
-                    );
-                    const childRemote = yield* headRemote(
-                      link.headRepository ?? null,
-                      Number(link.pr),
-                    );
-                    const [remoteParentHead, branchHead, remoteBranchHead] = yield* Effect.all([
-                      git.remoteHead(parentRemote, String(link.parent)),
-                      git.head(branch),
-                      git.remoteHead(childRemote, branch),
-                    ]);
-                    if (
-                      Option.isNone(remoteParentHead) ||
-                      remoteParentHead.value !== savedParentHead
-                    ) {
-                      return yield* Effect.fail(
-                        new StackOperationError(
-                          `current preservation parent remote head diverged for ${link.parent}; expected ${savedParentHead}`,
-                        ),
-                      );
-                    }
-                    if (
-                      Option.isNone(branchHead) ||
-                      Option.isNone(remoteBranchHead) ||
-                      remoteBranchHead.value !== branchHead.value
-                    ) {
-                      return yield* Effect.fail(
-                        new StackOperationError(
-                          `current preservation child remote head diverged for ${branch}; expected ${Option.getOrNull(branchHead)}`,
-                        ),
-                      );
-                    }
-                    savedParentBoundaryVerified = true;
-                    break;
                   }
                 }
                 if (

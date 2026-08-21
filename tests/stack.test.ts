@@ -1458,6 +1458,14 @@ const verifyPreservationRootHistoricalChildLanding = (opts?: {
           log,
           pulls: [pr(3811, "root", "main"), pr(3812, "child", "root")],
           metas: [metaFor(pr(3811, "root", "main")), metaFor(pr(3812, "child", "root"))],
+          ...(opts?.failure
+            ? {}
+            : {
+                changeBoundaries: new Map([
+                  [3811, { head: preservationRoot, base: rootAnchor }],
+                  [3812, { head: originalChild, base: preservationRoot }],
+                ]),
+              }),
         }),
       ),
       Layer.provideMerge(
