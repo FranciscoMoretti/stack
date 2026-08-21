@@ -134,20 +134,23 @@ const syncCommand = Command.make(
     branch: Argument.string("branch").pipe(Argument.optional),
     apply,
     continueOnFailure,
+    repairDepth,
   },
-  Effect.fn(function* ({ branch, apply, continueOnFailure }) {
+  Effect.fn(function* ({ branch, apply, continueOnFailure, repairDepth }) {
     const stack = yield* Stack;
     const branchValue = Option.getOrUndefined(branch);
+    const repairDepthValue = Option.getOrUndefined(repairDepth);
     const items = yield* stack.sync({
       apply,
       continueOnFailure,
       ...(branchValue === undefined ? {} : { branch: branchValue }),
+      ...(repairDepthValue === undefined ? {} : { repairDepth: repairDepthValue }),
     });
     yield* Console.log(items.join("\n"));
   }),
 ).pipe(
   Command.withDescription(
-    "Infer stack links from code-host target branches (GitHub PRs / GitLab MRs), clean stale metadata, repair branches, retarget changes, and refresh stack links. If branch is omitted and the current branch is on a stack, sync only that stack; otherwise sync the repo. By default this is a dry run. Add --apply to mutate branches, changes, and stack metadata.",
+    "Infer stack links from code-host target branches (GitHub PRs / GitLab MRs), clean stale metadata, repair branches, retarget changes, and refresh stack links. If branch is omitted and the current branch is on a stack, sync only that stack; otherwise sync the repo. By default this is a dry run. Add --repair-depth <n> to bound repair to the root plus n descendant layers, and add --apply to mutate branches, changes, and stack metadata.",
   ),
   Command.withExamples([
     {
@@ -157,6 +160,10 @@ const syncCommand = Command.make(
     {
       command: "stack sync effectify-watcher",
       description: "Preview only the stack containing effectify-watcher",
+    },
+    {
+      command: "stack sync effectify-watcher --repair-depth 2",
+      description: "Preview the stack root plus at most two descendant repair layers",
     },
     {
       command: "stack sync --apply",

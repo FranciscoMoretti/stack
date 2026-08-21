@@ -366,6 +366,7 @@ export const layer = Layer.effect(
     const replayBase = Effect.fn("CodeHost.github.replayBase")(function* (
       pr: number,
       currentBase: string,
+      previousBase?: string,
     ) {
       const repositoryArgs = ["repo", "view", "--json", "nameWithOwner"];
       const repository = yield* run(repositoryArgs).pipe(
@@ -443,10 +444,11 @@ export const layer = Layer.effect(
         .filter((item): item is BaseRefChangedEvent => item?.currentRefName === currentBase)
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
         .at(-1);
-      if (latestForcePush && (!event || latestForcePush.createdAt > event.createdAt)) {
+      if (latestForcePush && event && latestForcePush.createdAt > event.createdAt) {
         return yield* forcePushReplay();
       }
-      if (!event) return Option.none<CodeHost.ReplayBase>();
+      const priorBranch = event?.previousRefName ?? previousBase;
+      if (!priorBranch) return yield* forcePushReplay();
 
       const mergedArgs = [
         "pr",
@@ -454,7 +456,7 @@ export const layer = Layer.effect(
         "--state",
         "merged",
         "--head",
-        event.previousRefName,
+        priorBranch,
         "--json",
         "number,headRefName,headRefOid,mergedAt",
         "--limit",
@@ -463,9 +465,9 @@ export const layer = Layer.effect(
       const merged = yield* run(mergedArgs).pipe(
         Effect.flatMap((out) => decodeMergedPulls(mergedArgs, out)),
       );
-      const eventTime = Date.parse(event.createdAt);
+      const eventTime = event ? Date.parse(event.createdAt) : Number.POSITIVE_INFINITY;
       const parent = merged
-        .filter((item) => item.headRefName === event.previousRefName)
+        .filter((item) => item.headRefName === priorBranch)
         .sort((left, right) => {
           const leftDistance = Math.abs(Date.parse(left.mergedAt ?? "") - eventTime);
           const rightDistance = Math.abs(Date.parse(right.mergedAt ?? "") - eventTime);
@@ -474,13 +476,15 @@ export const layer = Layer.effect(
       if (!parent) {
         const currentHead = forcePushHistory.data.repository?.pullRequest?.headRefOid;
         if (
+          event &&
           latestForcePush &&
           latestForcePush.createdAt < event.createdAt &&
           latestForcePush.afterCommit?.oid === currentHead
         ) {
           return yield* forcePushReplay();
         }
-        return yield* Effect.fail(new CodeHostReplayBaseNotFoundError(pr, event.previousRefName));
+        if (!event) return yield* forcePushReplay();
+        return yield* Effect.fail(new CodeHostReplayBaseNotFoundError(pr, priorBranch));
       }
 
       const parentForcePushArgs = [
@@ -506,7 +510,7 @@ export const layer = Layer.effect(
 
       return Option.some({
         kind: "merged-parent" as const,
-        branch: event.previousRefName,
+        branch: priorBranch,
         currentBase,
         head: parent.headRefOid,
         historicalHeads,

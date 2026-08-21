@@ -5030,6 +5030,42 @@ describe("Stack", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("sync bounds descendant repair depth", () => {
+    const seen: Array<number> = [];
+    const layer = stackTestLayer({
+      current: "dev",
+      refs: [
+        ref("dev", "aaa"),
+        ref("app-root", "app"),
+        ref("app-child", "app-child"),
+        ref("app-grandchild", "app-grandchild"),
+      ],
+      pulls: [
+        pr(1, "app-root", "dev"),
+        pr(2, "app-child", "app-root"),
+        pr(3, "app-grandchild", "app-child"),
+      ],
+      bases: bases(
+        ["app-root", "dev", "aaa"],
+        ["app-child", "app-root", "app"],
+        ["app-grandchild", "app-child", "app-child"],
+      ),
+      service: {
+        body: (number) => Effect.sync(() => void seen.push(number)),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      const items = yield* stack.sync({ branch: "app-root", apply: true, repairDepth: 1 });
+
+      expect(items.join("\n")).toContain("app-root #1");
+      expect(items.join("\n")).toContain("app-child #2");
+      expect(items.join("\n")).not.toContain("app-grandchild");
+      expect(seen.sort()).toEqual([1, 2]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("branch-scoped sync preview preserves its scope in the apply command", () => {
     const layer = stackTestLayer({
       current: "dev",
@@ -5912,6 +5948,71 @@ describe("Stack", () => {
 
       expect(seen).toContain("rebase child origin/dev child-only");
       expect(seen).not.toContain("rebase child origin/dev parent-1,parent-2,child-only");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("sync trusts an exact historical parent head from durable host state", () => {
+    const seen: Array<string> = [];
+    const replayParents: Array<string | undefined> = [];
+    const layer = stackTestLayer({
+      current: "child",
+      refs: [ref("dev", "dev-squash"), ref("child", "child-head")],
+      pulls: [pr(2, "child", "dev")],
+      bases: bases(["child", "dev", "dev-old"], ["child", "parent-anchor", "parent-anchor"]),
+      state: stackState([
+        stackLink({ branch: "landed-parent", parent: "dev", anchor: "dev-old", pr: 1 }),
+        stackLink({
+          branch: "child",
+          parent: "landed-parent",
+          anchor: "parent-anchor",
+          pr: 2,
+        }),
+      ]),
+      service: {
+        head: (name) =>
+          Effect.succeed(
+            Option.fromNullishOr(
+              {
+                child: "child-head",
+                dev: "dev-squash",
+                "origin/dev": "dev-squash",
+                "parent-anchor": "parent-anchor",
+                "repaired-parent": "repaired-parent",
+              }[name],
+            ),
+          ),
+        commits: (from, branch) =>
+          Effect.succeed(
+            branch === "child" && from === "parent-anchor" ? ["child-one", "child-two"] : [],
+          ),
+        fetchRef: () => Effect.succeed("repaired-parent"),
+        replayBase: (_number, _currentBase, previousBase) =>
+          Effect.sync(() => {
+            replayParents.push(previousBase);
+            return Option.some<CodeHost.ReplayBase>({
+              kind: "merged-parent",
+              branch: "landed-parent",
+              currentBase: "dev",
+              head: "repaired-parent",
+              historicalHeads: ["parent-anchor"],
+              fetchRef: "refs/pull/1/head",
+              change: 1,
+            });
+          }),
+        novel: (parent, branch, commits) =>
+          Effect.sync(() => {
+            seen.push(`rebase ${branch} ${parent} ${commits.join(",")}`);
+            return commits;
+          }),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const stack = yield* Stack;
+      yield* stack.sync({ branch: "child" });
+
+      expect(seen).toEqual(["rebase child origin/dev child-one,child-two"]);
+      expect(replayParents).toContain("landed-parent");
     }).pipe(Effect.provide(layer));
   });
 

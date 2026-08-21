@@ -60,6 +60,7 @@ export interface StackService {
     readonly apply?: boolean;
     readonly branch?: string;
     readonly continueOnFailure?: boolean;
+    readonly repairDepth?: number;
   }) => Effect.Effect<ReadonlyArray<string>, StackError>;
   readonly doctor: () => Effect.Effect<ReadonlyArray<string>, StackError>;
   readonly last: () => Effect.Effect<ReadonlyArray<string>, StackError>;
@@ -694,6 +695,7 @@ ${note}`;
             const actions: Array<StackResult.StackResultItem> = [];
             const kept = new Array<StackLink>();
             const replayAnchors = new Map<string, string>();
+            const replayParents = new Map<string, string>();
 
             for (const link of state.links) {
               const branch = String(link.branch);
@@ -735,7 +737,10 @@ ${note}`;
                 if (Option.isSome(anchor)) {
                   const oldParent = String(link.parent);
                   const oldParentTracked = plannedParents.has(oldParent) || trunks.has(oldParent);
-                  if (!oldParentTracked) replayAnchors.set(branch, String(link.anchor));
+                  if (!oldParentTracked) {
+                    replayAnchors.set(branch, String(link.anchor));
+                    replayParents.set(branch, oldParent);
+                  }
                   const next = stackLink({
                     branch,
                     parent,
@@ -788,6 +793,7 @@ ${note}`;
               state: stackState(reconciled.sort((a, b) => a.branch.localeCompare(b.branch))),
               actions,
               replayAnchors,
+              replayParents,
             };
           }),
       );
@@ -817,6 +823,7 @@ ${note}`;
             readonly journalActions?: ReadonlyArray<StackResult.StackResultItem>;
             readonly initialActions?: ReadonlyArray<StackResult.StackResultItem>;
             readonly replayAnchors?: ReadonlyMap<string, string>;
+            readonly replayParents?: ReadonlyMap<string, string>;
             readonly writeState?: (
               state: ReturnType<typeof stackState>,
             ) => Effect.Effect<void, StackError>;
@@ -832,6 +839,7 @@ ${note}`;
             const apply = opts.apply;
             const saved = opts.saved ?? new Map<string, string>();
             const replayAnchors = opts.replayAnchors ?? new Map<string, string>();
+            const replayParents = opts.replayParents ?? new Map<string, string>();
             const journalState = opts.journalState ?? state;
             const journalActions = opts.journalActions ?? [];
             const initialActions = opts.initialActions ?? [];
@@ -1021,7 +1029,11 @@ ${note}`;
                 }
               });
               if (!savedParent && trunk(parent) && link.pr) {
-                const recovered = yield* codeHost.replayBase(Number(link.pr), parent);
+                const recovered = yield* codeHost.replayBase(
+                  Number(link.pr),
+                  parent,
+                  replayParents.get(branch) ?? String(link.parent),
+                );
                 if (Option.isSome(recovered)) {
                   if (recovered.value.kind === "force-push-boundary") {
                     const { boundary, semanticHead } = recovered.value;
@@ -1040,11 +1052,14 @@ ${note}`;
                     }
                     candidates.push(recovered.value.head);
                     candidates.push(...recovered.value.historicalHeads);
-                    if (recovered.value.head === anchor) {
-                      const embeddedParent = yield* git.base(branch, recovered.value.head);
+                    const hostedParentHeads = [
+                      recovered.value.head,
+                      ...recovered.value.historicalHeads,
+                    ];
+                    if (hostedParentHeads.includes(anchor)) {
+                      const embeddedParent = yield* git.base(branch, anchor);
                       hostedParentBoundaryVerified =
-                        Option.isSome(embeddedParent) &&
-                        embeddedParent.value === recovered.value.head;
+                        Option.isSome(embeddedParent) && embeddedParent.value === anchor;
                     }
                   }
                 }
@@ -2143,6 +2158,12 @@ ${note}`;
           const dryRun = !apply;
           const requestedBranch = opts?.branch;
           const continueOnFailure = opts?.continueOnFailure ?? false;
+          const repairDepth = opts?.repairDepth;
+          if (repairDepth !== undefined && (!Number.isInteger(repairDepth) || repairDepth < 0)) {
+            return yield* Effect.fail(
+              new StackOperationError("repair depth must be a non-negative integer"),
+            );
+          }
           const current = requestedBranch && dryRun ? "" : yield* git.current();
           return yield* Effect.gen(function* () {
             if (!dryRun) yield* clean();
@@ -2183,7 +2204,10 @@ ${note}`;
                 } | null>(null);
               }
               const root = graph.rootOf(branch);
-              return Effect.succeed({ root, branches: scopedBranches(planned, root) });
+              return Effect.succeed({
+                root,
+                branches: scopedBranches(planned, root, repairDepth),
+              });
             };
             const scope = requestedBranch
               ? yield* resolveScope(requestedBranch, true)
@@ -2208,6 +2232,13 @@ ${note}`;
                         ),
                       )
                     : reconciled.replayAnchors;
+                  const replayParents = target
+                    ? new Map(
+                        [...reconciled.replayParents].filter(([branch]) =>
+                          target.branches.has(branch),
+                        ),
+                      )
+                    : reconciled.replayParents;
                   const writeState = target ? writeScopedState(target.branches) : undefined;
                   const scopedPulls = yield* changesForLinks(scoped.links, pulls);
                   const repair = yield* repairStack(scoped, refs, scopedPulls, {
@@ -2215,6 +2246,7 @@ ${note}`;
                     preflightReplays: true,
                     journalState: state,
                     replayAnchors,
+                    replayParents,
                     initialActions: scopedInitial,
                     ...(writeState ? { writeState } : {}),
                     preserveUndo,
